@@ -24,7 +24,7 @@ Or add it as a flake input.
 
 ### Non-Nix
 
-Requires a Rust toolchain (stable, edition 2024) and `wl-clipboard` for clipboard yanks on Wayland (`xclip`/`xsel` are not used).
+Requires a Rust toolchain (stable, edition 2024). Linux (X11 and Wayland) and macOS are supported; Windows is not.
 
 ```
 git clone git@github.com:matthewtapps/todone.git
@@ -74,12 +74,10 @@ Paste the URL into the `ics_url` field in settings.
 
 In addition to general clipboard support for vim-mode yanks, there are leader shortcuts that copy formatted output:
 
-- `yt`: HTML formatted for pasting into Microsoft Teams (yesterday/today sections, bullets, nested sub-items).
+- `yt`: HTML formatted for pasting into Microsoft Teams (yesterday/today sections, bullets, nested sub-items). A plain-text alternative is included for clients that don't accept HTML.
 - `yx`: plain text, newline-separated, no bullet markers. Useful for time-tracking tools like Xero that don't render lists.
 - `yd`: yesterday's "did" as plain bullets.
 - `yp`: today's "planning" as plain bullets.
-
-Wayland users need `wl-clipboard` on `$PATH`. The Nix package wraps it in for you.
 
 ## History
 

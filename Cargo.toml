@@ -19,6 +19,7 @@ icalendar = { version = "0.17", features = ["chrono-tz", "recurrence"] }
 chrono-tz = "0.10"
 rrule = "0.14"
 windows-timezones = "0.5"
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [profile.release]
 lto = true

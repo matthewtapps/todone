@@ -15,11 +15,6 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
-        nativeBuildInputs = [ pkgs.makeWrapper ];
-        postInstall = ''
-          wrapProgram $out/bin/todone \
-            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.wl-clipboard ]}
-        '';
         meta = {
           description = "Persistent work tracking TUI";
           mainProgram = "todone";
@@ -34,7 +29,6 @@
           clippy
           rust-analyzer
           pkg-config
-          wl-clipboard
         ];
       };
     };

@@ -126,6 +126,11 @@ pub struct App<'a> {
     calendar_error: Option<String>,
     calendar_in_flight: bool,
     context_state: ContextState,
+    /// System clipboard, kept alive for the whole session. Linux/Wayland needs
+    /// the owner process to remain alive to serve paste requests. `None` if
+    /// initialisation failed (e.g. no display server) — yanks become no-ops
+    /// with an error in the status bar.
+    clipboard: Option<clipboard::Clipboard>,
 }
 
 const STATUS_MSG_DURATION: Duration = Duration::from_secs(2);
@@ -194,6 +199,7 @@ impl<'a> App<'a> {
             calendar_error: None,
             calendar_in_flight: false,
             context_state: ContextState::new(initial_tab),
+            clipboard: clipboard::Clipboard::new().ok(),
         };
         app.refresh_styles();
         app.init_gitlab();
@@ -716,8 +722,24 @@ impl<'a> App<'a> {
 
     fn yank_teams(&mut self) {
         let store = self.current_store_view();
-        let text = format::standup_html(&store, self.viewing_date);
-        match clipboard::copy_html(&text) {
+        let html = format::standup_html(&store, self.viewing_date);
+        // Plain-text alt for clipboard consumers that don't accept HTML.
+        let yest = storage::previous_workday(self.viewing_date);
+        let did = store.get(yest).map(|e| &e.did[..]).unwrap_or(&[]);
+        let planning = store
+            .get(self.viewing_date)
+            .map(|e| &e.planning[..])
+            .unwrap_or(&[]);
+        let plain = format!(
+            "Yesterday\n{}\n\nToday\n{}",
+            format::bullets(did),
+            format::bullets(planning),
+        );
+        let Some(cb) = self.clipboard.as_mut() else {
+            self.set_status("E: clipboard unavailable");
+            return;
+        };
+        match cb.copy_html(&html, &plain) {
             Ok(()) => self.set_status("yanked teams"),
             Err(e) => self.set_status(format!("E: clipboard: {e}")),
         }
@@ -750,7 +772,11 @@ impl<'a> App<'a> {
     }
 
     fn copy_to_clipboard(&mut self, text: String, ok_msg: impl Into<String>) {
-        match clipboard::copy(&text) {
+        let Some(cb) = self.clipboard.as_mut() else {
+            self.set_status("E: clipboard unavailable");
+            return;
+        };
+        match cb.copy(&text) {
             Ok(()) => self.set_status(ok_msg),
             Err(e) => self.set_status(format!("E: clipboard: {e}")),
         }
