@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow};
@@ -55,8 +55,14 @@ impl RawVevent {
 /// (VTIMEZONE, VCALENDAR-level props, etc.) are ignored. Malformed VEVENTs
 /// missing DTSTART are skipped silently — one bad event shouldn't poison the
 /// whole feed.
+///
+/// Office365's published feeds use Windows TZ names like
+/// `AUS Eastern Standard Time` instead of IANA names. These are translated to
+/// their IANA equivalents up front so that both icalendar's recurrence
+/// builder and our own timezone resolution succeed.
 pub fn parse_ics(text: &str) -> Result<Vec<RawVevent>> {
-    let cal = Calendar::from_str(text).map_err(|e| anyhow!("parsing ICS: {e}"))?;
+    let translated = translate_windows_tzids(text);
+    let cal = Calendar::from_str(&translated).map_err(|e| anyhow!("parsing ICS: {e}"))?;
     let mut out = Vec::new();
     for comp in &cal.components {
         let CalendarComponent::Event(ev) = comp else { continue };
@@ -65,6 +71,62 @@ pub fn parse_ics(text: &str) -> Result<Vec<RawVevent>> {
         }
     }
     Ok(out)
+}
+
+/// Rewrite every `TZID=Foo` parameter and `TZID:Foo` property whose value is
+/// a recognised Windows timezone (e.g. `AUS Eastern Standard Time`) into its
+/// IANA equivalent (`Australia/Sydney`). Values that don't match a known
+/// Windows zone are left alone — they're presumed to already be IANA.
+fn translate_windows_tzids(body: &str) -> String {
+    use windows_timezones::WindowsTimezone;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in body.lines() {
+        if let Some(value) = extract_tzid_value(line) {
+            seen.insert(value.to_string());
+        }
+    }
+
+    let mut translations: Vec<(String, String)> = Vec::new();
+    for name in seen {
+        if let Ok(wtz) = name.parse::<WindowsTimezone>() {
+            translations.push((name, wtz.tzdb_id().to_string()));
+        }
+    }
+    if translations.is_empty() {
+        return body.to_string();
+    }
+
+    // Replace only inside TZID= and TZID: contexts so we don't corrupt event
+    // descriptions or other free-text fields that might coincidentally share
+    // the Windows TZ string.
+    let mut out = body.to_string();
+    for (windows, iana) in &translations {
+        out = out.replace(&format!("TZID={windows}"), &format!("TZID={iana}"));
+        out = out.replace(&format!("TZID:{windows}"), &format!("TZID:{iana}"));
+    }
+    out
+}
+
+/// Return the TZID value embedded in a single (unfolded) ICS line, if any.
+/// Handles both `;TZID=Foo:` parameter form and `TZID:Foo` property form.
+fn extract_tzid_value(line: &str) -> Option<&str> {
+    let idx = line.find("TZID")?;
+    let after = &line[idx + 4..];
+    let sep = after.chars().next()?;
+    if sep != '=' && sep != ':' {
+        return None;
+    }
+    let value_str = &line[idx + 5..];
+    let end = if sep == '=' {
+        value_str
+            .find(|c: char| c == ':' || c == ';')
+            .unwrap_or(value_str.len())
+    } else {
+        value_str.len()
+    };
+    let value = value_str[..end].trim_end_matches('\r');
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn raw_from_event(ev: &Event) -> Option<RawVevent> {
@@ -336,9 +398,7 @@ impl Client {
         Ok(Self { url, http })
     }
 
-    /// Fetch and parse the calendar. Returns raw VEVENTs; call
-    /// `materialize_non_recurring` (Phase 2) or the upcoming recurrence
-    /// expander (Phase 3) to get concrete events.
+    /// Fetch and parse the calendar. Returns raw VEVENTs.
     pub async fn fetch(&self) -> Result<Vec<RawVevent>> {
         let body = self
             .http
@@ -360,6 +420,7 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/calendar_basic.ics");
+    const WINDOWS_TZ_FIXTURE: &str = include_str!("../tests/fixtures/calendar_windows_tz.ics");
 
     /// Window large enough to include every event in the fixture (single,
     /// all-day, multi-day, and ~5 weeks of the weekly recurrence).
@@ -494,6 +555,48 @@ mod tests {
             .expect("override should appear on its new date");
         assert!(moved.summary.contains("rescheduled"));
         assert_eq!(moved.start.format("%H:%M").to_string(), "11:00");
+    }
+
+    #[test]
+    fn windows_tzids_are_translated_to_iana() {
+        let translated = translate_windows_tzids(WINDOWS_TZ_FIXTURE);
+        assert!(
+            !translated.contains("AUS Eastern Standard Time"),
+            "Windows TZ name should be rewritten"
+        );
+        assert!(
+            translated.contains("Australia/Sydney"),
+            "should contain the IANA equivalent"
+        );
+    }
+
+    #[test]
+    fn office365_single_event_materialises() {
+        let raws = parse_ics(WINDOWS_TZ_FIXTURE).unwrap();
+        let start = local_midnight(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()).unwrap();
+        let end = local_midnight(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()).unwrap();
+        let events = materialize(&raws, start, end);
+        assert!(
+            events.iter().any(|e| e.uid == "msft-single@example.com"),
+            "single Office365 event must materialise"
+        );
+    }
+
+    #[test]
+    fn office365_recurring_event_expands() {
+        let raws = parse_ics(WINDOWS_TZ_FIXTURE).unwrap();
+        let start = local_midnight(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()).unwrap();
+        let end = local_midnight(NaiveDate::from_ymd_opt(2026, 5, 31).unwrap()).unwrap();
+        let events = materialize(&raws, start, end);
+        let count = events
+            .iter()
+            .filter(|e| e.uid == "msft-weekly@example.com")
+            .count();
+        // ~4-5 Mondays in May 2026.
+        assert!(
+            count >= 4,
+            "weekly recurrence in Windows TZ should expand: got {count}"
+        );
     }
 
     #[test]

@@ -1395,6 +1395,7 @@ dependencies = [
  "tokio",
  "toml",
  "tui-textarea",
+ "windows-timezones",
 ]
 
 [[package]]
@@ -2021,6 +2022,12 @@ dependencies = [
  "windows_x86_64_gnullvm",
  "windows_x86_64_msvc",
 ]
+
+[[package]]
+name = "windows-timezones"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53bce119c4ac0adfe0945781383966cc9838c853c2876fa3bf71662d76df4ef2"
 
 [[package]]
 name = "windows_aarch64_gnullvm"

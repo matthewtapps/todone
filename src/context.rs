@@ -7,13 +7,17 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use crate::calendar::CalendarEvent;
 use crate::gitlab::{RawEvent, summarise};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Planning,
     Gitlab,
+    Calendar,
 }
+
+const TAB_ORDER: [Tab; 3] = [Tab::Planning, Tab::Gitlab, Tab::Calendar];
 
 pub struct ContextState {
     pub tab: Tab,
@@ -25,11 +29,13 @@ impl ContextState {
     }
 
     pub fn cycle(&mut self, delta: i32) {
-        let tabs = [Tab::Planning, Tab::Gitlab];
-        let cur = tabs.iter().position(|t| *t == self.tab).unwrap_or(0) as i32;
-        let n = tabs.len() as i32;
+        let cur = TAB_ORDER
+            .iter()
+            .position(|t| *t == self.tab)
+            .unwrap_or(0) as i32;
+        let n = TAB_ORDER.len() as i32;
         let next = (cur + delta).rem_euclid(n) as usize;
-        self.tab = tabs[next];
+        self.tab = TAB_ORDER[next];
     }
 }
 
@@ -40,17 +46,33 @@ pub enum GitlabPaneStatus<'a> {
     Error(&'a str),
 }
 
+pub enum CalendarPaneStatus<'a> {
+    Disabled,
+    Loading,
+    Error(&'a str),
+    Events {
+        yesterday: &'a [CalendarEvent],
+        today: &'a [CalendarEvent],
+    },
+}
+
 pub fn draw(
     f: &mut Frame,
     area: Rect,
     state: &ContextState,
     yesterday: NaiveDate,
+    viewing_date: NaiveDate,
     planning: &[String],
     gitlab: GitlabPaneStatus,
+    calendar: CalendarPaneStatus,
     focused: bool,
 ) {
-    let event_count = match &gitlab {
+    let gitlab_count = match &gitlab {
         GitlabPaneStatus::Events(e) => Some(e.len()),
+        _ => None,
+    };
+    let calendar_counts = match &calendar {
+        CalendarPaneStatus::Events { yesterday, today } => Some((yesterday.len(), today.len())),
         _ => None,
     };
 
@@ -72,7 +94,7 @@ pub fn draw(
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
-    draw_tabs(f, chunks[0], state, event_count);
+    draw_tabs(f, chunks[0], state, gitlab_count, calendar_counts);
 
     if chunks.len() < 2 {
         return;
@@ -80,14 +102,25 @@ pub fn draw(
     match state.tab {
         Tab::Planning => draw_planning(f, chunks[1], planning),
         Tab::Gitlab => draw_gitlab(f, chunks[1], &gitlab),
+        Tab::Calendar => draw_calendar(f, chunks[1], &calendar, yesterday, viewing_date),
     }
 }
 
-fn draw_tabs(f: &mut Frame, area: Rect, state: &ContextState, event_count: Option<usize>) {
+fn draw_tabs(
+    f: &mut Frame,
+    area: Rect,
+    state: &ContextState,
+    gitlab_count: Option<usize>,
+    calendar_counts: Option<(usize, usize)>,
+) {
     let planning_label = "Yesterday Planning";
-    let gitlab_label = match event_count {
+    let gitlab_label = match gitlab_count {
         Some(n) => format!("GitLab ({n})"),
         None => "GitLab".to_string(),
+    };
+    let calendar_label = match calendar_counts {
+        Some((y, t)) => format!("Calendar ({y}/{t})"),
+        None => "Calendar".to_string(),
     };
 
     let active = Style::default()
@@ -105,6 +138,11 @@ fn draw_tabs(f: &mut Frame, area: Rect, state: &ContextState, event_count: Optio
         Span::styled(
             gitlab_label,
             if state.tab == Tab::Gitlab { active } else { inactive },
+        ),
+        Span::raw("    "),
+        Span::styled(
+            calendar_label,
+            if state.tab == Tab::Calendar { active } else { inactive },
         ),
         Span::styled(
             "        [ ] switch tab",
@@ -177,6 +215,127 @@ fn draw_gitlab(f: &mut Frame, area: Rect, status: &GitlabPaneStatus) {
         }
     };
     f.render_widget(Paragraph::new(body), area);
+}
+
+fn draw_calendar(
+    f: &mut Frame,
+    area: Rect,
+    status: &CalendarPaneStatus,
+    yesterday: NaiveDate,
+    today: NaiveDate,
+) {
+    let width = area.width as usize;
+    match status {
+        CalendarPaneStatus::Disabled => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " Calendar integration disabled — enable in <Space>s settings",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                area,
+            );
+        }
+        CalendarPaneStatus::Loading => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " fetching…",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                area,
+            );
+        }
+        CalendarPaneStatus::Error(msg) => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" error: {msg}"),
+                    Style::default().fg(Color::Red),
+                ))),
+                area,
+            );
+        }
+        CalendarPaneStatus::Events { yesterday: y_events, today: t_events } => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            let col_width = (width / 2).max(1);
+            draw_calendar_column(f, cols[0], yesterday, y_events, col_width);
+            draw_calendar_column(f, cols[1], today, t_events, col_width);
+        }
+    }
+}
+
+fn draw_calendar_column(
+    f: &mut Frame,
+    area: Rect,
+    date: NaiveDate,
+    events: &[CalendarEvent],
+    width: usize,
+) {
+    let mut body = Vec::new();
+    body.push(Line::from(Span::styled(
+        format!(" {}", format_date(date)),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if events.is_empty() {
+        body.push(Line::from(Span::styled(
+            "   (no events)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for ev in events {
+            body.extend(calendar_event_lines(ev, width));
+        }
+    }
+    f.render_widget(Paragraph::new(body), area);
+}
+
+/// Format one event as: " HH:MM-HH:MM  Summary" (or "  all day    Summary").
+/// Continuation rows of a wrapped summary hang-indent under the summary column.
+fn calendar_event_lines<'a>(ev: &CalendarEvent, width: usize) -> Vec<Line<'a>> {
+    const LEFT: usize = 1;
+    const GAP: usize = 2;
+    let time_label = format_time_range(ev);
+    let prefix_width = LEFT + time_label.chars().count() + GAP;
+    let body_width = width.saturating_sub(prefix_width).max(1);
+    let segments = wrap_words(&ev.summary, body_width);
+    let indent = " ".repeat(prefix_width);
+    let time_style = if ev.all_day {
+        Style::default().fg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    segments
+        .into_iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            if i == 0 {
+                Line::from(vec![
+                    Span::raw(" ".repeat(LEFT)),
+                    Span::styled(time_label.clone(), time_style),
+                    Span::raw(" ".repeat(GAP)),
+                    Span::raw(seg),
+                ])
+            } else {
+                Line::from(vec![Span::raw(indent.clone()), Span::raw(seg)])
+            }
+        })
+        .collect()
+}
+
+/// 11 chars wide for both modes so columns line up.
+fn format_time_range(ev: &CalendarEvent) -> String {
+    if ev.all_day {
+        "all day    ".to_string()
+    } else {
+        format!(
+            "{}-{}",
+            ev.start.format("%H:%M"),
+            ev.end.format("%H:%M")
+        )
+    }
 }
 
 /// Wrap a single GitLab summary line so continuation rows align under the
@@ -272,8 +431,10 @@ mod tests {
         s.cycle(1);
         assert_eq!(s.tab, Tab::Gitlab);
         s.cycle(1);
+        assert_eq!(s.tab, Tab::Calendar);
+        s.cycle(1);
         assert_eq!(s.tab, Tab::Planning);
         s.cycle(-1);
-        assert_eq!(s.tab, Tab::Gitlab);
+        assert_eq!(s.tab, Tab::Calendar);
     }
 }

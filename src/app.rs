@@ -23,7 +23,7 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::{
     calendar::{self, RawVevent},
     clipboard, config,
-    context::{ContextState, GitlabPaneStatus, Tab as ContextTab},
+    context::{CalendarPaneStatus, ContextState, GitlabPaneStatus, Tab as ContextTab},
     format,
     gitlab::{self, RawEvent},
     history::{HistoryAction, HistoryState},
@@ -146,9 +146,11 @@ impl<'a> App<'a> {
         let config_path = config::default_path()?;
         let settings = config::load(&config_path)?;
 
-        // Default to the GitLab tab when the user has set up the integration —
-        // it's the more valuable context once configured.
-        let initial_tab = if settings.gitlab.enabled {
+        // Prefer Calendar > GitLab > Planning when configured — both
+        // integrations carry more context than yesterday's planning bullets.
+        let initial_tab = if settings.calendar.enabled {
+            ContextTab::Calendar
+        } else if settings.gitlab.enabled {
             ContextTab::Gitlab
         } else {
             ContextTab::Planning
@@ -276,13 +278,7 @@ impl<'a> App<'a> {
                 match result {
                     Ok(events) => {
                         let n = events.len();
-                        if let Err(e) = dump_events(date, &events) {
-                            self.set_status(format!(
-                                "gitlab: {n} events for {date} (cache write E: {e})"
-                            ));
-                        } else {
-                            self.set_status(format!("gitlab: {n} events for {date}"));
-                        }
+                        self.set_status(format!("gitlab: {n} events for {date}"));
                         self.gitlab_cache.insert(
                             date,
                             GitlabCacheEntry { events, fetched_at: Instant::now() },
@@ -911,7 +907,7 @@ impl<'a> App<'a> {
     }
 
     fn draw_context_pane(&self, f: &mut Frame, area: Rect) {
-        let status = if self.gitlab_client.is_none() {
+        let gitlab_status = if self.gitlab_client.is_none() {
             GitlabPaneStatus::Disabled
         } else if let Some(entry) = self.gitlab_cache.get(&self.yesterday) {
             GitlabPaneStatus::Events(&entry.events)
@@ -926,13 +922,41 @@ impl<'a> App<'a> {
             // loading. Avoid the empty-state showing on first frame.
             GitlabPaneStatus::Loading
         };
+
+        // Materialise calendar events for the two columns up front so the
+        // pane renderer borrows owned slices.
+        let yesterday_evts: Vec<calendar::CalendarEvent> = self
+            .calendar_raws
+            .as_deref()
+            .map(|r| calendar::events_for_date(r, self.yesterday))
+            .unwrap_or_default();
+        let today_evts: Vec<calendar::CalendarEvent> = self
+            .calendar_raws
+            .as_deref()
+            .map(|r| calendar::events_for_date(r, self.viewing_date))
+            .unwrap_or_default();
+        let calendar_status = if self.calendar_client.is_none() {
+            CalendarPaneStatus::Disabled
+        } else if let Some(err) = &self.calendar_error {
+            CalendarPaneStatus::Error(err)
+        } else if self.calendar_raws.is_some() {
+            CalendarPaneStatus::Events {
+                yesterday: &yesterday_evts,
+                today: &today_evts,
+            }
+        } else {
+            CalendarPaneStatus::Loading
+        };
+
         crate::context::draw(
             f,
             area,
             &self.context_state,
             self.yesterday,
+            self.viewing_date,
             &self.yesterday_planning,
-            status,
+            gitlab_status,
+            calendar_status,
             self.focus == Pane::Context,
         );
     }
@@ -1228,21 +1252,6 @@ fn spawn_input_thread(tx: mpsc::Sender<AppEvent>) {
             return;
         }
     });
-}
-
-/// Persist raw events for `date` to ~/.cache/standup/gitlab/{date}.json so
-/// the user can inspect the API output during phase 2. Phase 3+ will surface
-/// this in-app via the context pane.
-fn dump_events(date: NaiveDate, events: &[RawEvent]) -> Result<()> {
-    let dir = dirs::cache_dir()
-        .ok_or_else(|| anyhow::anyhow!("no cache dir"))?
-        .join("standup")
-        .join("gitlab");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{date}.json"));
-    let json = serde_json::to_string_pretty(events)?;
-    std::fs::write(&path, json)?;
-    Ok(())
 }
 
 /// Word-wrap `text` to `width`, prepending `indent_spaces` spaces on every line

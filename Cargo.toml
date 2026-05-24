@@ -18,6 +18,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 icalendar = { version = "0.17", features = ["chrono-tz", "recurrence"] }
 chrono-tz = "0.10"
 rrule = "0.14"
+windows-timezones = "0.5"
 
 [profile.release]
 lto = true
