@@ -124,7 +124,11 @@ fn draw_planning(f: &mut Frame, area: Rect, planning: &[String]) {
     } else {
         planning
             .iter()
-            .flat_map(|b| wrap_with_prefix(" - ", b, Style::default(), width))
+            .flat_map(|b| {
+                let (level, content) = crate::format::parse_item(b);
+                let prefix = if level == 0 { " - " } else { "   - " };
+                wrap_with_prefix(prefix, content, Style::default(), width)
+            })
             .collect()
     };
     f.render_widget(Paragraph::new(body), area);

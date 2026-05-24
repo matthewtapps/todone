@@ -2,6 +2,17 @@ use chrono::NaiveDate;
 
 use crate::storage::{Entry, Store, previous_workday};
 
+/// A line starting with `- ` (after trimming) denotes a sub-item nested under
+/// the most recent top-level item. Returns `(level, content)` where level is
+/// 0 for top-level and 1 for sub-items.
+pub fn parse_item(item: &str) -> (usize, &str) {
+    if let Some(rest) = item.strip_prefix("- ") {
+        (1, rest)
+    } else {
+        (0, item)
+    }
+}
+
 /// Teams-paste standup for a given day, as HTML to be put on the clipboard
 /// with the `text/html` MIME type. Teams renders this as bold headings
 /// followed by bullet lists.
@@ -28,10 +39,43 @@ fn push_html_section(out: &mut String, items: &[String]) {
         return;
     }
     out.push_str("<ul>");
-    for item in items {
-        out.push_str("<li>");
-        push_html_escaped(out, item);
-        out.push_str("</li>");
+    let mut i = 0;
+    while i < items.len() {
+        let (level, content) = parse_item(&items[i]);
+        if level == 0 {
+            out.push_str("<li>");
+            push_html_escaped(out, content);
+            // Lookahead: collect any sub-items immediately following this
+            // parent into a nested <ul> *inside* its <li>.
+            let mut j = i + 1;
+            let mut sub_open = false;
+            while j < items.len() {
+                let (lvl, sub_content) = parse_item(&items[j]);
+                if lvl == 0 {
+                    break;
+                }
+                if !sub_open {
+                    out.push_str("<ul>");
+                    sub_open = true;
+                }
+                out.push_str("<li>");
+                push_html_escaped(out, sub_content);
+                out.push_str("</li>");
+                j += 1;
+            }
+            if sub_open {
+                out.push_str("</ul>");
+            }
+            out.push_str("</li>");
+            i = j;
+        } else {
+            // Orphan sub-item (no preceding top-level): render as top-level
+            // rather than dropping or wrapping in an empty <li>.
+            out.push_str("<li>");
+            push_html_escaped(out, content);
+            out.push_str("</li>");
+            i += 1;
+        }
     }
     out.push_str("</ul>");
 }
@@ -69,8 +113,12 @@ pub fn bullets(items: &[String]) -> String {
 
 fn push_bullets(out: &mut String, items: &[String]) {
     for item in items {
-        out.push_str("- ");
-        out.push_str(item);
+        let (level, content) = parse_item(item);
+        out.push_str(match level {
+            0 => "- ",
+            _ => "  - ",
+        });
+        out.push_str(content);
         out.push('\n');
     }
 }
@@ -144,5 +192,74 @@ mod tests {
     fn bullets_trims_trailing_newline() {
         let out = bullets(&["x".into(), "y".into()]);
         assert_eq!(out, "- x\n- y");
+    }
+
+    #[test]
+    fn standup_html_nests_dash_prefixed_sub_items() {
+        let mut store = Store::default();
+        store.entry_mut(d("2026-05-22")).did = vec![
+            "MR Review".into(),
+            "- Session data polling".into(),
+            "Navigation sidebar feature".into(),
+        ];
+        store.entry_mut(d("2026-05-25")).planning = vec!["x".into()];
+        let out = standup_html(&store, d("2026-05-25"));
+        assert_eq!(
+            out,
+            "<b>Yesterday</b><ul>\
+             <li>MR Review<ul><li>Session data polling</li></ul></li>\
+             <li>Navigation sidebar feature</li>\
+             </ul><b>Today</b><ul><li>x</li></ul>"
+        );
+    }
+
+    #[test]
+    fn standup_html_groups_multiple_sub_items() {
+        let mut store = Store::default();
+        store.entry_mut(d("2026-05-22")).did = vec![
+            "parent".into(),
+            "- sub a".into(),
+            "- sub b".into(),
+            "next parent".into(),
+        ];
+        store.entry_mut(d("2026-05-25")).planning = vec!["x".into()];
+        let out = standup_html(&store, d("2026-05-25"));
+        assert!(out.contains(
+            "<li>parent<ul><li>sub a</li><li>sub b</li></ul></li><li>next parent</li>"
+        ));
+    }
+
+    #[test]
+    fn standup_html_orphan_sub_item_becomes_top_level() {
+        let mut store = Store::default();
+        store.entry_mut(d("2026-05-22")).did = vec!["- orphan".into(), "parent".into()];
+        store.entry_mut(d("2026-05-25")).planning = vec!["x".into()];
+        let out = standup_html(&store, d("2026-05-25"));
+        assert!(out.contains("<ul><li>orphan</li><li>parent</li></ul>"));
+    }
+
+    #[test]
+    fn timesheet_keeps_dash_prefix_on_sub_items() {
+        let mut store = Store::default();
+        store.entry_mut(d("2026-05-22")).did = vec![
+            "MR Review".into(),
+            "- Session data polling".into(),
+            "Navigation sidebar feature".into(),
+        ];
+        let out = timesheet(&store, d("2026-05-22"));
+        assert_eq!(
+            out,
+            "MR Review\n- Session data polling\nNavigation sidebar feature"
+        );
+    }
+
+    #[test]
+    fn bullets_indents_sub_items() {
+        let out = bullets(&[
+            "parent".into(),
+            "- sub".into(),
+            "other".into(),
+        ]);
+        assert_eq!(out, "- parent\n  - sub\n- other");
     }
 }
