@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveTime, TimeZone};
 use chrono_tz::Tz;
 use icalendar::{
-    Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, Event,
+    Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, Event, EventLike,
 };
 
 /// A concrete calendar event instance, ready to render. For all-day events
@@ -20,8 +21,9 @@ pub struct CalendarEvent {
     pub location: Option<String>,
 }
 
-/// Raw VEVENT data, keeping recurrence properties intact so a later phase can
-/// expand them. Phase 2 only materialises VEVENTs that have no RRULE.
+/// Raw VEVENT, retained alongside extracted view fields. The underlying
+/// `Event` is kept so that recurrence expansion can call `get_recurrence()`
+/// to assemble the RRuleSet from DTSTART/RRULE/RDATE/EXDATE.
 #[derive(Debug, Clone)]
 pub struct RawVevent {
     pub uid: String,
@@ -29,20 +31,23 @@ pub struct RawVevent {
     pub location: Option<String>,
     pub start: DatePerhapsTime,
     pub end: Option<DatePerhapsTime>,
-    pub rrule: Option<String>,
-    pub exdates: Vec<String>,
-    pub rdates: Vec<String>,
     pub recurrence_id: Option<DatePerhapsTime>,
     pub status: Option<String>,
+    pub has_rrule: bool,
+    pub event: Event,
 }
 
 impl RawVevent {
     pub fn is_recurring(&self) -> bool {
-        self.rrule.is_some()
+        self.has_rrule
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.status.as_deref() == Some("CANCELLED")
+    }
+
+    pub fn is_override(&self) -> bool {
+        self.recurrence_id.is_some()
     }
 }
 
@@ -65,18 +70,6 @@ pub fn parse_ics(text: &str) -> Result<Vec<RawVevent>> {
 fn raw_from_event(ev: &Event) -> Option<RawVevent> {
     let start = ev.get_start()?;
     let end = ev.get_end();
-    let exdates = ev
-        .multi_properties()
-        .get("EXDATE")
-        .into_iter()
-        .flatten()
-        .map(|p| p.value().to_string())
-        .collect();
-    let rdates = ev
-        .properties()
-        .get("RDATE")
-        .map(|p| vec![p.value().to_string()])
-        .unwrap_or_default();
     Some(RawVevent {
         uid: ev.get_uid().unwrap_or("").to_string(),
         summary: ev.get_summary().unwrap_or("(no title)").to_string(),
@@ -86,21 +79,81 @@ fn raw_from_event(ev: &Event) -> Option<RawVevent> {
             .map(str::to_owned),
         start,
         end,
-        rrule: ev.property_value("RRULE").map(str::to_owned),
-        exdates,
-        rdates,
         recurrence_id: ev.get_recurrence_id(),
         status: ev.property_value("STATUS").map(str::to_owned),
+        has_rrule: ev.property_value("RRULE").is_some(),
+        event: ev.clone(),
     })
 }
 
-/// Materialise all non-recurring events from `raws`. Cancelled VEVENTs are
-/// dropped. Recurring events are deferred to a later phase.
-pub fn materialize_non_recurring(raws: &[RawVevent]) -> Vec<CalendarEvent> {
-    raws.iter()
-        .filter(|r| !r.is_recurring() && !r.is_cancelled())
-        .filter_map(materialize_one)
-        .collect()
+/// Materialise concrete instances from `raws` covering `[window_start, window_end)`.
+/// Recurring events are expanded via `rrule`; RECURRENCE-ID overrides replace or
+/// suppress (when STATUS:CANCELLED) the matching expanded instance.
+///
+/// Bounding the expansion to a small window is essential — unbounded recurrences
+/// (no UNTIL/COUNT) only terminate because of the window.
+pub fn materialize(
+    raws: &[RawVevent],
+    window_start: DateTime<Local>,
+    window_end: DateTime<Local>,
+) -> Vec<CalendarEvent> {
+    let mut out = Vec::new();
+
+    // Split overrides from masters. Overrides are keyed by (uid, the original
+    // instance's start) so the recurrence expander can swap or skip them.
+    let masters: Vec<&RawVevent> = raws.iter().filter(|r| !r.is_override()).collect();
+    let master_uids: std::collections::HashSet<&str> =
+        masters.iter().map(|r| r.uid.as_str()).collect();
+
+    let mut overrides: HashMap<(String, DateTime<Local>), &RawVevent> = HashMap::new();
+    let mut orphan_overrides: Vec<&RawVevent> = Vec::new();
+    for raw in raws.iter().filter(|r| r.is_override()) {
+        let Some(rid) = raw.recurrence_id.as_ref() else {
+            continue;
+        };
+        let Some(rid_local) = date_perhaps_time_to_local(rid) else {
+            continue;
+        };
+        if master_uids.contains(raw.uid.as_str()) {
+            overrides.insert((raw.uid.clone(), rid_local), raw);
+        } else {
+            orphan_overrides.push(raw);
+        }
+    }
+
+    for master in &masters {
+        if master.is_cancelled() {
+            continue;
+        }
+        if master.is_recurring() {
+            expand_recurring(master, &overrides, window_start, window_end, &mut out);
+        } else if let Some(ev) = materialize_one(master) {
+            push_if_in_window(ev, window_start, window_end, &mut out);
+        }
+    }
+
+    // Overrides whose master isn't in the feed (rare). Treat as standalone.
+    for orphan in orphan_overrides {
+        if orphan.is_cancelled() {
+            continue;
+        }
+        if let Some(ev) = materialize_one(orphan) {
+            push_if_in_window(ev, window_start, window_end, &mut out);
+        }
+    }
+
+    out
+}
+
+fn push_if_in_window(
+    ev: CalendarEvent,
+    window_start: DateTime<Local>,
+    window_end: DateTime<Local>,
+    out: &mut Vec<CalendarEvent>,
+) {
+    if ev.end > window_start && ev.start < window_end {
+        out.push(ev);
+    }
 }
 
 fn materialize_one(raw: &RawVevent) -> Option<CalendarEvent> {
@@ -113,6 +166,69 @@ fn materialize_one(raw: &RawVevent) -> Option<CalendarEvent> {
         summary: raw.summary.clone(),
         location: raw.location.clone(),
     })
+}
+
+/// Expand a recurring VEVENT within `[window_start, window_end)`, substituting
+/// or suppressing instances based on RECURRENCE-ID overrides.
+fn expand_recurring(
+    master: &RawVevent,
+    overrides: &HashMap<(String, DateTime<Local>), &RawVevent>,
+    window_start: DateTime<Local>,
+    window_end: DateTime<Local>,
+    out: &mut Vec<CalendarEvent>,
+) {
+    let Ok(set) = master.event.get_recurrence() else {
+        return;
+    };
+    let duration = base_duration(master);
+    let all_day = matches!(master.start, DatePerhapsTime::Date(_));
+
+    let after = local_to_rrule_utc(window_start);
+    let before = local_to_rrule_utc(window_end);
+    // 1000 is comfortably above any realistic count over a few days even for
+    // sub-hour recurrences. rrule won't iterate beyond `before` anyway.
+    let result = set.after(after).before(before).all(1000);
+
+    for occurrence in result.dates {
+        let start = occurrence.with_timezone(&Local);
+        let key = (master.uid.clone(), start);
+        if let Some(override_raw) = overrides.get(&key) {
+            if override_raw.is_cancelled() {
+                continue;
+            }
+            if let Some(ev) = materialize_one(override_raw) {
+                push_if_in_window(ev, window_start, window_end, out);
+            }
+        } else {
+            let ev = CalendarEvent {
+                uid: master.uid.clone(),
+                start,
+                end: start + duration,
+                all_day,
+                summary: master.summary.clone(),
+                location: master.location.clone(),
+            };
+            push_if_in_window(ev, window_start, window_end, out);
+        }
+    }
+}
+
+fn base_duration(raw: &RawVevent) -> Duration {
+    resolve_times(&raw.start, raw.end.as_ref())
+        .map(|(s, e, _)| e - s)
+        .unwrap_or_else(Duration::zero)
+}
+
+fn date_perhaps_time_to_local(d: &DatePerhapsTime) -> Option<DateTime<Local>> {
+    match d {
+        DatePerhapsTime::Date(d) => local_midnight(*d),
+        DatePerhapsTime::DateTime(cdt) => cdt_to_local(cdt),
+    }
+}
+
+fn local_to_rrule_utc(dt: DateTime<Local>) -> DateTime<rrule::Tz> {
+    let utc = dt.with_timezone(&chrono::Utc);
+    rrule::Tz::UTC.from_utc_datetime(&utc.naive_utc())
 }
 
 /// Convert a VEVENT's DTSTART/DTEND into local-time bounds. For all-day
@@ -230,52 +346,64 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../tests/fixtures/calendar_basic.ics");
 
+    /// Window large enough to include every event in the fixture (single,
+    /// all-day, multi-day, and ~5 weeks of the weekly recurrence).
+    fn wide_window() -> (DateTime<Local>, DateTime<Local>) {
+        let start = local_midnight(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()).unwrap();
+        let end = local_midnight(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()).unwrap();
+        (start, end)
+    }
+
     #[test]
     fn parses_single_timed_event() {
         let raws = parse_ics(FIXTURE).unwrap();
-        let single = raws.iter().find(|r| r.uid == "single@example.com").unwrap();
+        let single = raws
+            .iter()
+            .find(|r| r.uid == "single@example.com")
+            .unwrap();
         assert_eq!(single.summary, "Single Standup");
         assert!(!single.is_recurring());
     }
 
     #[test]
-    fn parses_all_day_event() {
+    fn materialises_all_day_event_with_day_long_span() {
         let raws = parse_ics(FIXTURE).unwrap();
-        let all_day = raws.iter().find(|r| r.uid == "allday@example.com").unwrap();
-        let events = materialize_non_recurring(&[all_day.clone()]);
-        assert_eq!(events.len(), 1);
-        assert!(events[0].all_day);
-        // All-day end is the next day's midnight (RFC 5545 exclusive).
-        assert_eq!(
-            (events[0].end - events[0].start),
-            chrono::Duration::days(1)
-        );
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
+        let all_day = events
+            .iter()
+            .find(|e| e.uid == "allday@example.com")
+            .unwrap();
+        assert!(all_day.all_day);
+        assert_eq!(all_day.end - all_day.start, Duration::days(1));
     }
 
     #[test]
-    fn parses_multi_day_event() {
+    fn materialises_multi_day_event() {
         let raws = parse_ics(FIXTURE).unwrap();
-        let multi = raws.iter().find(|r| r.uid == "multiday@example.com").unwrap();
-        let events = materialize_non_recurring(&[multi.clone()]);
-        assert_eq!(events.len(), 1);
-        assert!(events[0].all_day);
-        assert_eq!(events[0].end - events[0].start, chrono::Duration::days(3));
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
+        let multi = events
+            .iter()
+            .find(|e| e.uid == "multiday@example.com")
+            .unwrap();
+        assert!(multi.all_day);
+        assert_eq!(multi.end - multi.start, Duration::days(3));
     }
 
     #[test]
-    fn skips_recurring_events_in_phase_2() {
+    fn drops_cancelled_master_events() {
         let raws = parse_ics(FIXTURE).unwrap();
-        let has_recurring = raws.iter().any(|r| r.is_recurring());
-        assert!(has_recurring, "fixture should contain a recurring event");
-        let events = materialize_non_recurring(&raws);
-        assert!(events.iter().all(|e| e.uid != "weekly@example.com"));
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
+        assert!(events.iter().all(|e| e.uid != "cancelled@example.com"));
     }
 
     #[test]
     fn events_on_picks_overlapping_only() {
         let raws = parse_ics(FIXTURE).unwrap();
-        let events = materialize_non_recurring(&raws);
-        // Fixture's single event is on 2026-05-22.
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
         let on_day = events_on(&events, NaiveDate::from_ymd_opt(2026, 5, 22).unwrap());
         assert!(on_day.iter().any(|e| e.uid == "single@example.com"));
         let off_day = events_on(&events, NaiveDate::from_ymd_opt(2026, 5, 21).unwrap());
@@ -285,8 +413,8 @@ mod tests {
     #[test]
     fn events_on_includes_multi_day_for_each_covered_day() {
         let raws = parse_ics(FIXTURE).unwrap();
-        let events = materialize_non_recurring(&raws);
-        // Multi-day runs 2026-06-01..2026-06-04.
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
         for day in [
             NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
             NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(),
@@ -298,15 +426,70 @@ mod tests {
                 "multi-day should appear on {day}"
             );
         }
-        // Excludes the exclusive end date.
         let after = events_on(&events, NaiveDate::from_ymd_opt(2026, 6, 4).unwrap());
         assert!(after.iter().all(|e| e.uid != "multiday@example.com"));
     }
 
     #[test]
-    fn drops_cancelled_events() {
+    fn expands_weekly_recurrence_within_window() {
         let raws = parse_ics(FIXTURE).unwrap();
-        let events = materialize_non_recurring(&raws);
-        assert!(events.iter().all(|e| e.uid != "cancelled@example.com"));
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
+        // 2026-05-25 (the DTSTART itself) should appear.
+        let on = events_on(&events, NaiveDate::from_ymd_opt(2026, 5, 25).unwrap());
+        assert!(
+            on.iter().any(|e| e.uid == "weekly@example.com" && !e.summary.contains("rescheduled")),
+            "first weekly instance should appear"
+        );
+        // 2026-06-22 is 4 weeks later — still expanded.
+        let later = events_on(&events, NaiveDate::from_ymd_opt(2026, 6, 22).unwrap());
+        assert!(
+            later.iter().any(|e| e.uid == "weekly@example.com"),
+            "later weekly instance should appear"
+        );
+    }
+
+    #[test]
+    fn exdate_suppresses_instance() {
+        let raws = parse_ics(FIXTURE).unwrap();
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
+        let on = events_on(&events, NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+        assert!(
+            on.iter().all(|e| e.uid != "weekly@example.com"),
+            "EXDATE'd weekly instance must not appear"
+        );
+    }
+
+    #[test]
+    fn recurrence_id_override_replaces_instance() {
+        let raws = parse_ics(FIXTURE).unwrap();
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
+        // Original 2026-06-08 should be replaced by override on 2026-06-09 11:00.
+        let on_original = events_on(&events, NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
+        assert!(
+            on_original.iter().all(|e| e.uid != "weekly@example.com"),
+            "overridden instance must not appear on its original date"
+        );
+        let on_new = events_on(&events, NaiveDate::from_ymd_opt(2026, 6, 9).unwrap());
+        let moved = on_new
+            .iter()
+            .find(|e| e.uid == "weekly@example.com")
+            .expect("override should appear on its new date");
+        assert!(moved.summary.contains("rescheduled"));
+        assert_eq!(moved.start.format("%H:%M").to_string(), "11:00");
+    }
+
+    #[test]
+    fn cancelled_override_suppresses_instance() {
+        let raws = parse_ics(FIXTURE).unwrap();
+        let (s, e) = wide_window();
+        let events = materialize(&raws, s, e);
+        let on = events_on(&events, NaiveDate::from_ymd_opt(2026, 6, 15).unwrap());
+        assert!(
+            on.iter().all(|e| e.uid != "weekly@example.com"),
+            "cancelled override must suppress the instance"
+        );
     }
 }

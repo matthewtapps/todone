@@ -15,8 +15,9 @@ dirs = "6"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-icalendar = { version = "0.17", features = ["chrono-tz"] }
+icalendar = { version = "0.17", features = ["chrono-tz", "recurrence"] }
 chrono-tz = "0.10"
+rrule = "0.14"
 
 [profile.release]
 lto = true
