@@ -51,6 +51,14 @@ impl Store {
             .rev()
             .collect()
     }
+
+    /// Earliest date with any recorded content.
+    pub fn first_recorded(&self) -> Option<NaiveDate> {
+        self.entries
+            .iter()
+            .find(|(_, e)| !e.is_empty())
+            .map(|(d, _)| *d)
+    }
 }
 
 pub fn default_path() -> Result<PathBuf> {
@@ -102,6 +110,17 @@ pub fn previous_workday(d: NaiveDate) -> NaiveDate {
     d - Duration::days(back)
 }
 
+/// Next *work* day. Fri -> Mon, Sat -> Mon, Sun -> Mon, else day + 1.
+pub fn next_workday(d: NaiveDate) -> NaiveDate {
+    let forward = match d.weekday() {
+        Weekday::Fri => 3,
+        Weekday::Sat => 2,
+        Weekday::Sun => 1,
+        _ => 1,
+    };
+    d + Duration::days(forward)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +151,28 @@ mod tests {
     fn workday_sunday_to_friday() {
         // 2026-05-24 is a Sunday.
         assert_eq!(previous_workday(d("2026-05-24")), d("2026-05-22"));
+    }
+
+    #[test]
+    fn next_workday_friday_to_monday() {
+        // 2026-05-22 is a Friday.
+        assert_eq!(next_workday(d("2026-05-22")), d("2026-05-25"));
+    }
+
+    #[test]
+    fn next_workday_saturday_to_monday() {
+        assert_eq!(next_workday(d("2026-05-23")), d("2026-05-25"));
+    }
+
+    #[test]
+    fn next_workday_sunday_to_monday() {
+        assert_eq!(next_workday(d("2026-05-24")), d("2026-05-25"));
+    }
+
+    #[test]
+    fn next_workday_thursday_to_friday() {
+        // 2026-05-21 is Thursday.
+        assert_eq!(next_workday(d("2026-05-21")), d("2026-05-22"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     clipboard, format,
+    history::{HistoryAction, HistoryState},
     storage::{self, Store, previous_workday},
     vim::{Mode, VimBuffer},
 };
@@ -29,8 +30,15 @@ enum Pane {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Verb {
+enum Pending {
     Yank,
+    Leader,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Today,
+    History,
 }
 
 pub struct App<'a> {
@@ -53,8 +61,11 @@ pub struct App<'a> {
     status_msg: Option<String>,
     /// When `status_msg` should be cleared automatically.
     status_msg_until: Option<Instant>,
-    /// `Some` when a verb has been pressed and we're waiting for its target key.
-    pending_verb: Option<Verb>,
+    /// `Some` when a verb/leader has been pressed and we're waiting for its target key.
+    pending: Option<Pending>,
+    screen: Screen,
+    history: HistoryState,
+    help_open: bool,
 }
 
 const STATUS_MSG_DURATION: Duration = Duration::from_secs(2);
@@ -86,7 +97,10 @@ impl<'a> App<'a> {
             ex_command: None,
             status_msg: None,
             status_msg_until: None,
-            pending_verb: None,
+            pending: None,
+            screen: Screen::Today,
+            history: HistoryState::new(today),
+            help_open: false,
         };
         app.refresh_styles();
         Ok(app)
@@ -95,9 +109,13 @@ impl<'a> App<'a> {
     /// Move the viewing date by `delta` calendar days. Saves the current
     /// buffer state to the store first, then reloads from the new date.
     fn navigate_days(&mut self, delta: i64) {
+        self.go_to_date(self.viewing_date + chrono::Duration::days(delta));
+    }
+
+    fn go_to_date(&mut self, new_date: NaiveDate) {
         self.save_buffers_to_store();
-        self.viewing_date += chrono::Duration::days(delta);
-        self.yesterday = previous_workday(self.viewing_date);
+        self.viewing_date = new_date;
+        self.yesterday = previous_workday(new_date);
         let (yp, did_lines, planning_lines) =
             load_view(&self.store, self.yesterday, self.viewing_date);
         self.yesterday_planning = yp;
@@ -157,22 +175,52 @@ impl<'a> App<'a> {
         // Any new keystroke dismisses the previous transient status message;
         // the 2s timeout is only for the idle case.
         self.clear_status();
+        // Help overlay swallows the next keystroke and dismisses.
+        if self.help_open {
+            self.help_open = false;
+            return;
+        }
         // Ex command mode owns all keystrokes until completed or cancelled.
         if self.ex_command.is_some() {
             self.handle_ex_key(k);
             return;
         }
-        // A pending verb consumes the next keystroke as its target (or cancels).
-        if let Some(verb) = self.pending_verb.take() {
-            self.handle_verb_target(verb, k);
-            return;
-        }
-        // Global: Ctrl-Q quits. Always wins, even in insert mode.
+        // Global: Ctrl-Q quits. Always wins, on any screen and in any mode.
         if k.code == KeyCode::Char('q') && k.modifiers.contains(M::CONTROL) {
             self.quit = true;
             return;
         }
-        // Global: Tab switches panes. Always wins, in any mode (no Tab inside bullets).
+        match self.screen {
+            Screen::Today => self.handle_today_key(k),
+            Screen::History => self.handle_history_key(k),
+        }
+    }
+
+    fn handle_history_key(&mut self, k: KeyEvent) {
+        // `?` is universal: opens help without leaving the history screen.
+        if k.code == KeyCode::Char('?') && k.modifiers.is_empty() {
+            self.help_open = true;
+            return;
+        }
+        let action = self.history.handle_key(k, &self.store);
+        match action {
+            HistoryAction::None => {}
+            HistoryAction::Close => self.screen = Screen::Today,
+            HistoryAction::Select(date) => {
+                self.go_to_date(date);
+                self.screen = Screen::Today;
+            }
+        }
+    }
+
+    fn handle_today_key(&mut self, k: KeyEvent) {
+        use crossterm::event::KeyModifiers as M;
+        // A pending verb/leader consumes the next keystroke as its target.
+        if let Some(p) = self.pending.take() {
+            self.handle_pending(p, k);
+            return;
+        }
+        // Tab switches panes. Always wins; we don't put Tab characters in bullets.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
             self.focus = match self.focus {
                 Pane::Did => Pane::Planning,
@@ -181,7 +229,7 @@ impl<'a> App<'a> {
             return;
         }
         // Send to the focused vim buffer. If it returns false, the key is a
-        // normal-mode app-level verb (q quit, y yank, : ex, <space> leader).
+        // normal-mode app-level verb (q quit, y yank, : ex, <space> leader, </> nav).
         let buf = self.focused_buf();
         let consumed = buf.input(k);
         if !consumed {
@@ -201,7 +249,11 @@ impl<'a> App<'a> {
             return;
         }
         if k.code == KeyCode::Char('y') && k.modifiers.is_empty() {
-            self.pending_verb = Some(Verb::Yank);
+            self.pending = Some(Pending::Yank);
+            return;
+        }
+        if k.code == KeyCode::Char(' ') && k.modifiers.is_empty() {
+            self.pending = Some(Pending::Leader);
             return;
         }
         let plain_or_shift = k.modifiers.is_empty()
@@ -214,18 +266,29 @@ impl<'a> App<'a> {
             self.navigate_days(1);
             return;
         }
-        // <space> leader is wired up when we add the help overlay.
+        if plain_or_shift && k.code == KeyCode::Char('?') {
+            self.help_open = true;
+            return;
+        }
     }
 
-    fn handle_verb_target(&mut self, verb: Verb, k: KeyEvent) {
+    fn handle_pending(&mut self, p: Pending, k: KeyEvent) {
         // Esc or any non-target key cancels silently.
-        match (verb, k.code) {
-            (Verb::Yank, KeyCode::Char('t')) => self.yank_teams(),
-            (Verb::Yank, KeyCode::Char('x')) => self.yank_xero(),
-            (Verb::Yank, KeyCode::Char('d')) => self.yank_did(),
-            (Verb::Yank, KeyCode::Char('p')) => self.yank_planning(),
+        match (p, k.code) {
+            (Pending::Yank, KeyCode::Char('t')) => self.yank_teams(),
+            (Pending::Yank, KeyCode::Char('x')) => self.yank_xero(),
+            (Pending::Yank, KeyCode::Char('d')) => self.yank_did(),
+            (Pending::Yank, KeyCode::Char('p')) => self.yank_planning(),
+            (Pending::Leader, KeyCode::Char('h')) => self.open_history(),
+            (Pending::Leader, KeyCode::Char('?')) => self.help_open = true,
             _ => {}
         }
+    }
+
+    fn open_history(&mut self) {
+        self.save_buffers_to_store();
+        self.history = HistoryState::new(self.today);
+        self.screen = Screen::History;
     }
 
     fn yank_teams(&mut self) {
@@ -377,17 +440,31 @@ impl<'a> App<'a> {
         );
     }
 
-    fn draw(&self, f: &mut Frame) {
+    fn draw(&mut self, f: &mut Frame) {
+        let area = f.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-            .split(f.area());
+            .split(area);
         self.draw_header(f, chunks[0]);
 
+        match self.screen {
+            Screen::Today => self.draw_today(f, chunks[1]),
+            Screen::History => self.history.draw(f, chunks[1], &self.store),
+        }
+
+        self.draw_status(f, chunks[2]);
+
+        if self.help_open {
+            crate::help::draw(f, area);
+        }
+    }
+
+    fn draw_today(&self, f: &mut Frame, area: Rect) {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[1]);
+            .split(area);
 
         let top = Layout::default()
             .direction(Direction::Horizontal)
@@ -397,8 +474,6 @@ impl<'a> App<'a> {
         self.draw_yesterday_planning(f, top[0]);
         f.render_widget(&self.did_buf.area, top[1]);
         f.render_widget(&self.planning_buf.area, rows[1]);
-
-        self.draw_status(f, chunks[2]);
     }
 
     fn draw_yesterday_planning(&self, f: &mut Frame, area: Rect) {
@@ -466,21 +541,66 @@ impl<'a> App<'a> {
             f.render_widget(Paragraph::new(line), area);
             return;
         }
-        if let Some(Verb::Yank) = self.pending_verb {
-            let line = Line::from(vec![
+        match self.pending {
+            Some(Pending::Yank) => {
+                let line = Line::from(vec![
+                    Span::styled(
+                        " YANK ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " t: teams    x: xero    d: did    p: planning    (any other key cancels) ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                f.render_widget(Paragraph::new(line), area);
+                return;
+            }
+            Some(Pending::Leader) => {
+                let line = Line::from(vec![
+                    Span::styled(
+                        " LEADER ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " h: history    (any other key cancels) ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                f.render_widget(Paragraph::new(line), area);
+                return;
+            }
+            None => {}
+        }
+        if self.screen == Screen::History {
+            let mut spans = vec![
                 Span::styled(
-                    " YANK ",
+                    format!(" HISTORY ({}) ", self.history.view_label()),
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Magenta)
+                        .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " t: teams    x: xero    d: did    p: planning    (any other key cancels) ",
+                    " j/k move    Enter select    ?: keybinds    q back ",
                     Style::default().fg(Color::DarkGray),
                 ),
-            ]);
-            f.render_widget(Paragraph::new(line), area);
+            ];
+            if let Some(n) = self.history.count_display() {
+                spans.push(Span::styled(
+                    format!("    [{n}] "),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
         let mode = self.focused_mode();
@@ -489,8 +609,8 @@ impl<'a> App<'a> {
             Mode::Insert => (Color::Black, Color::Yellow),
         };
         let hint = match mode {
-            Mode::Normal => " i/a/o insert  hjkl move  dd/cc/D/x del  u/Ctrl-R undo  y{t,x,d,p} yank  </> day  :w/:wq/:q  Tab switch  q quit ",
-            Mode::Insert => " Esc/jj: normal    Ctrl-Backspace: delete word    Tab: switch ",
+            Mode::Normal => " i insert    </> day    y yank    <space>h history    ?: keybinds    q quit ",
+            Mode::Insert => " Esc/jj normal    Tab switch    ?: keybinds ",
         };
         let line = Line::from(vec![
             Span::styled(

@@ -193,7 +193,7 @@ impl<'a> VimBuffer<'a> {
             Pending::None => {}
         }
 
-        // App-level verbs: defer to caller (q=quit, y=yank, space=leader, : ex, </> nav).
+        // App-level verbs: defer to caller (q=quit, y=yank, space=leader, : ex, </> nav, ?=help).
         if k.modifiers.is_empty() || k.modifiers == M::SHIFT {
             if matches!(
                 k.code,
@@ -203,6 +203,7 @@ impl<'a> VimBuffer<'a> {
                     | KeyCode::Char(':')
                     | KeyCode::Char('<')
                     | KeyCode::Char('>')
+                    | KeyCode::Char('?')
             ) {
                 return false;
             }
