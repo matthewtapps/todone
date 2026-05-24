@@ -1,4 +1,5 @@
 mod app;
+mod calendar;
 mod clipboard;
 mod config;
 mod context;
