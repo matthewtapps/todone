@@ -2,21 +2,49 @@ use chrono::NaiveDate;
 
 use crate::storage::{Entry, Store, previous_workday};
 
-/// Teams-style standup for a given day:
-///   **Yesterday** = previous_workday(day).did
-///   **Today**     = day.planning
-pub fn standup(store: &Store, day: NaiveDate) -> String {
+/// Teams-paste standup for a given day, as HTML to be put on the clipboard
+/// with the `text/html` MIME type. Teams renders this as bold headings
+/// followed by bullet lists.
+///
+/// Shape: `<b>Yesterday</b><ul><li>...</li>...</ul><b>Today</b><ul>...</ul>`.
+/// Empty sections substitute a `<br>` for the `<ul>` so the next heading
+/// doesn't end up inline with the previous one.
+pub fn standup_html(store: &Store, day: NaiveDate) -> String {
     let yest = previous_workday(day);
     let did = store.get(yest).map(|e| &e.did[..]).unwrap_or(&[]);
     let planning = store.get(day).map(|e| &e.planning[..]).unwrap_or(&[]);
 
     let mut out = String::new();
-    out.push_str("**Yesterday**\n");
-    push_bullets(&mut out, did);
-    out.push('\n');
-    out.push_str("**Today**\n");
-    push_bullets(&mut out, planning);
+    out.push_str("<b>Yesterday</b>");
+    push_html_section(&mut out, did);
+    out.push_str("<b>Today</b>");
+    push_html_section(&mut out, planning);
     out
+}
+
+fn push_html_section(out: &mut String, items: &[String]) {
+    if items.is_empty() {
+        out.push_str("<br>");
+        return;
+    }
+    out.push_str("<ul>");
+    for item in items {
+        out.push_str("<li>");
+        push_html_escaped(out, item);
+        out.push_str("</li>");
+    }
+    out.push_str("</ul>");
+}
+
+fn push_html_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
 }
 
 /// Timesheet for a given day: the `did` bullets, plain text, one per line, no prefix.
@@ -64,26 +92,37 @@ mod tests {
     }
 
     #[test]
-    fn standup_pulls_yesterday_from_previous_workday() {
+    fn standup_html_pulls_yesterday_from_previous_workday() {
         let mut store = Store::default();
         // Friday: what I did
-        store.entry_mut(d("2026-05-22")).did = vec!["finished feature X".into(), "reviewed PRs".into()];
+        store.entry_mut(d("2026-05-22")).did =
+            vec!["finished feature X".into(), "reviewed PRs".into()];
         // Monday: my plan
         store.entry_mut(d("2026-05-25")).planning = vec!["start feature Y".into()];
 
-        let out = standup(&store, d("2026-05-25"));
+        let out = standup_html(&store, d("2026-05-25"));
         assert_eq!(
             out,
-            "**Yesterday**\n- finished feature X\n- reviewed PRs\n\n**Today**\n- start feature Y\n"
+            "<b>Yesterday</b><ul><li>finished feature X</li><li>reviewed PRs</li></ul>\
+             <b>Today</b><ul><li>start feature Y</li></ul>"
         );
     }
 
     #[test]
-    fn standup_handles_missing_yesterday() {
+    fn standup_html_uses_br_when_a_section_is_empty() {
         let mut store = Store::default();
         store.entry_mut(d("2026-05-26")).planning = vec!["thing".into()];
-        let out = standup(&store, d("2026-05-26"));
-        assert_eq!(out, "**Yesterday**\n\n**Today**\n- thing\n");
+        let out = standup_html(&store, d("2026-05-26"));
+        assert_eq!(out, "<b>Yesterday</b><br><b>Today</b><ul><li>thing</li></ul>");
+    }
+
+    #[test]
+    fn standup_html_escapes_special_chars() {
+        let mut store = Store::default();
+        store.entry_mut(d("2026-05-22")).did = vec!["a & b <c> \"d\"".into()];
+        store.entry_mut(d("2026-05-25")).planning = vec!["x".into()];
+        let out = standup_html(&store, d("2026-05-25"));
+        assert!(out.contains("<li>a &amp; b &lt;c&gt; \"d\"</li>"));
     }
 
     #[test]

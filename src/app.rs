@@ -36,7 +36,11 @@ enum Verb {
 pub struct App<'a> {
     path: PathBuf,
     store: Store,
+    /// The actual current date — fixed for the session, used to flag the
+    /// "is this today" indicator on the header.
     today: NaiveDate,
+    /// The date currently being edited. Starts at `today`; `</`>` move it.
+    viewing_date: NaiveDate,
     yesterday: NaiveDate,
     yesterday_planning: Vec<String>,
     did_buf: VimBuffer<'a>,
@@ -59,23 +63,11 @@ impl<'a> App<'a> {
     pub fn new(path: PathBuf) -> Result<Self> {
         let store = storage::load(&path)?;
         let today = Local::now().date_naive();
-        let yesterday = previous_workday(today);
+        let viewing_date = today;
+        let yesterday = previous_workday(viewing_date);
 
-        let yesterday_planning: Vec<String> = store
-            .get(yesterday)
-            .map(|e| e.planning.clone())
-            .unwrap_or_default();
-
-        // Yesterday's `did`: use existing did, else fall back to its planning as a draft prompt.
-        let did_lines: Vec<String> = store
-            .get(yesterday)
-            .map(|e| if e.did.is_empty() { e.planning.clone() } else { e.did.clone() })
-            .unwrap_or_default();
-
-        let planning_lines: Vec<String> = store
-            .get(today)
-            .map(|e| e.planning.clone())
-            .unwrap_or_default();
+        let (yesterday_planning, did_lines, planning_lines) =
+            load_view(&store, yesterday, viewing_date);
 
         let did_buf = VimBuffer::new(make_textarea(did_lines));
         let planning_buf = VimBuffer::new(make_textarea(planning_lines));
@@ -84,6 +76,7 @@ impl<'a> App<'a> {
             path,
             store,
             today,
+            viewing_date,
             yesterday,
             yesterday_planning,
             did_buf,
@@ -97,6 +90,28 @@ impl<'a> App<'a> {
         };
         app.refresh_styles();
         Ok(app)
+    }
+
+    /// Move the viewing date by `delta` calendar days. Saves the current
+    /// buffer state to the store first, then reloads from the new date.
+    fn navigate_days(&mut self, delta: i64) {
+        self.save_buffers_to_store();
+        self.viewing_date += chrono::Duration::days(delta);
+        self.yesterday = previous_workday(self.viewing_date);
+        let (yp, did_lines, planning_lines) =
+            load_view(&self.store, self.yesterday, self.viewing_date);
+        self.yesterday_planning = yp;
+        self.did_buf = VimBuffer::new(make_textarea(did_lines));
+        self.planning_buf = VimBuffer::new(make_textarea(planning_lines));
+        // Reset focus to the did pane so the user lands on the editable
+        // "what I did" target for the new day.
+        self.focus = Pane::Did;
+    }
+
+    fn save_buffers_to_store(&mut self) {
+        let mut store = std::mem::take(&mut self.store);
+        self.apply_buffer_state(&mut store);
+        self.store = store;
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
@@ -139,6 +154,9 @@ impl<'a> App<'a> {
 
     fn handle_key(&mut self, k: KeyEvent) {
         use crossterm::event::KeyModifiers as M;
+        // Any new keystroke dismisses the previous transient status message;
+        // the 2s timeout is only for the idle case.
+        self.clear_status();
         // Ex command mode owns all keystrokes until completed or cancelled.
         if self.ex_command.is_some() {
             self.handle_ex_key(k);
@@ -186,6 +204,16 @@ impl<'a> App<'a> {
             self.pending_verb = Some(Verb::Yank);
             return;
         }
+        let plain_or_shift = k.modifiers.is_empty()
+            || k.modifiers == crossterm::event::KeyModifiers::SHIFT;
+        if plain_or_shift && k.code == KeyCode::Char('<') {
+            self.navigate_days(-1);
+            return;
+        }
+        if plain_or_shift && k.code == KeyCode::Char('>') {
+            self.navigate_days(1);
+            return;
+        }
         // <space> leader is wired up when we add the help overlay.
     }
 
@@ -202,14 +230,20 @@ impl<'a> App<'a> {
 
     fn yank_teams(&mut self) {
         let store = self.current_store_view();
-        let text = format::standup(&store, self.today);
-        self.copy_to_clipboard(text, "yanked teams");
+        let text = format::standup_html(&store, self.viewing_date);
+        match clipboard::copy_html(&text) {
+            Ok(()) => self.set_status("yanked teams"),
+            Err(e) => self.set_status(format!("E: clipboard: {e}")),
+        }
     }
 
     fn yank_xero(&mut self) {
         let store = self.current_store_view();
         let text = format::timesheet(&store, self.yesterday);
-        self.copy_to_clipboard(text, format!("yanked xero ({})", self.yesterday));
+        self.copy_to_clipboard(
+            text,
+            format!("yanked xero ({})", format_date_short(self.yesterday)),
+        );
     }
 
     fn yank_did(&mut self) {
@@ -222,11 +256,11 @@ impl<'a> App<'a> {
     fn yank_planning(&mut self) {
         let store = self.current_store_view();
         let planning = store
-            .get(self.today)
+            .get(self.viewing_date)
             .map(|e| &e.planning[..])
             .unwrap_or(&[]);
         let text = format::bullets(planning);
-        self.copy_to_clipboard(text, "yanked today's planning");
+        self.copy_to_clipboard(text, "yanked planning");
     }
 
     fn copy_to_clipboard(&mut self, text: String, ok_msg: impl Into<String>) {
@@ -255,11 +289,11 @@ impl<'a> App<'a> {
             store.entry_mut(self.yesterday).did = did;
         }
         if planning.is_empty() {
-            if let Some(e) = store.entries.get_mut(&self.today) {
+            if let Some(e) = store.entries.get_mut(&self.viewing_date) {
                 e.planning.clear();
             }
         } else {
-            store.entry_mut(self.today).planning = planning;
+            store.entry_mut(self.viewing_date).planning = planning;
         }
     }
 
@@ -321,8 +355,14 @@ impl<'a> App<'a> {
     }
 
     fn refresh_styles(&mut self) {
-        let did_title = format!(" Yesterday ({}) — what I did ", self.yesterday);
-        let planning_title = format!(" Today ({}) — planning ", self.today);
+        let did_title = format!(
+            " Yesterday — {} — what I did ",
+            format_date_short(self.yesterday)
+        );
+        let planning_title = format!(
+            " Today — {} — planning ",
+            format_date_short(self.viewing_date)
+        );
         apply_focus(
             &mut self.did_buf.area,
             did_title,
@@ -365,7 +405,10 @@ impl<'a> App<'a> {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(format!(" Yesterday ({}) — planning (ref) ", self.yesterday));
+            .title(format!(
+                " Yesterday — {} — planning (ref) ",
+                format_date_short(self.yesterday)
+            ));
         let body = if self.yesterday_planning.is_empty() {
             vec![Line::from("(no planning recorded)").style(Style::default().fg(Color::DarkGray))]
         } else {
@@ -379,9 +422,32 @@ impl<'a> App<'a> {
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
-        let header = Paragraph::new(Line::from(format!(" standup — {} ", self.today)))
-            .style(Style::default().add_modifier(Modifier::BOLD));
-        f.render_widget(header, area);
+        let suffix = if self.viewing_date == self.today {
+            String::new()
+        } else {
+            let delta = (self.viewing_date - self.today).num_days();
+            if delta > 0 {
+                format!("  (+{delta}d)")
+            } else {
+                format!("  ({delta}d)")
+            }
+        };
+        let date_color = if self.viewing_date == self.today {
+            Color::Green
+        } else {
+            Color::Yellow
+        };
+        let line = Line::from(vec![
+            Span::styled(" standup — ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format_date_short(self.viewing_date),
+                Style::default()
+                    .fg(date_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(suffix, Style::default().fg(Color::Yellow)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
@@ -423,7 +489,7 @@ impl<'a> App<'a> {
             Mode::Insert => (Color::Black, Color::Yellow),
         };
         let hint = match mode {
-            Mode::Normal => " i/a/o insert  hjkl/w/b/e/0/$ move  gg/G ends  dd/cc/D/C/x del  u/Ctrl-R undo  y{t,x,d,p} yank  :w/:wq/:q  Tab switch  q quit ",
+            Mode::Normal => " i/a/o insert  hjkl move  dd/cc/D/x del  u/Ctrl-R undo  y{t,x,d,p} yank  </> day  :w/:wq/:q  Tab switch  q quit ",
             Mode::Insert => " Esc/jj: normal    Ctrl-Backspace: delete word    Tab: switch ",
         };
         let line = Line::from(vec![
@@ -446,6 +512,32 @@ impl<'a> App<'a> {
         self.store = store;
         Ok(())
     }
+}
+
+fn load_view(
+    store: &Store,
+    yesterday: NaiveDate,
+    viewing_date: NaiveDate,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let yesterday_planning = store
+        .get(yesterday)
+        .map(|e| e.planning.clone())
+        .unwrap_or_default();
+    // Yesterday's `did`: existing did, else its planning as a draft prompt.
+    let did_lines = store
+        .get(yesterday)
+        .map(|e| if e.did.is_empty() { e.planning.clone() } else { e.did.clone() })
+        .unwrap_or_default();
+    let planning_lines = store
+        .get(viewing_date)
+        .map(|e| e.planning.clone())
+        .unwrap_or_default();
+    (yesterday_planning, did_lines, planning_lines)
+}
+
+/// Display date used everywhere in the UI, e.g. `Fri May 22`. Year dropped per design.
+fn format_date_short(d: NaiveDate) -> String {
+    d.format("%a %b %-d").to_string()
 }
 
 fn make_textarea<'a>(lines: Vec<String>) -> TextArea<'a> {
