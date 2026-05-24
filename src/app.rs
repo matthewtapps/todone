@@ -8,12 +8,15 @@ use ratatui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use tui_textarea::{CursorMove, TextArea};
 
-use crate::storage::{self, Store, previous_workday};
+use crate::{
+    storage::{self, Store, previous_workday},
+    vim::{Mode, VimBuffer},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -27,8 +30,8 @@ pub struct App<'a> {
     today: NaiveDate,
     yesterday: NaiveDate,
     yesterday_planning: Vec<String>,
-    did_buf: TextArea<'a>,
-    planning_buf: TextArea<'a>,
+    did_buf: VimBuffer<'a>,
+    planning_buf: VimBuffer<'a>,
     focus: Pane,
     quit: bool,
 }
@@ -55,8 +58,8 @@ impl<'a> App<'a> {
             .map(|e| e.planning.clone())
             .unwrap_or_default();
 
-        let did_buf = make_textarea(did_lines);
-        let planning_buf = make_textarea(planning_lines);
+        let did_buf = VimBuffer::new(make_textarea(did_lines));
+        let planning_buf = VimBuffer::new(make_textarea(planning_lines));
 
         let mut app = Self {
             path,
@@ -81,6 +84,7 @@ impl<'a> App<'a> {
                     self.handle_key(k);
                 }
             }
+            self.refresh_styles();
         }
         self.persist()?;
         Ok(())
@@ -88,38 +92,64 @@ impl<'a> App<'a> {
 
     fn handle_key(&mut self, k: KeyEvent) {
         use crossterm::event::KeyModifiers as M;
-        // Quit: Ctrl-Q only for now (q is reserved for vim-normal-mode later).
+        // Global: Ctrl-Q quits. Always wins, even in insert mode.
         if k.code == KeyCode::Char('q') && k.modifiers.contains(M::CONTROL) {
             self.quit = true;
             return;
         }
+        // Global: Tab switches panes. Always wins, in any mode (no Tab inside bullets).
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
             self.focus = match self.focus {
                 Pane::Did => Pane::Planning,
                 Pane::Planning => Pane::Did,
             };
-            self.refresh_styles();
             return;
         }
-        // Everything else goes to the focused buffer (raw editing for now;
-        // vim modal layer wraps this in the next step).
-        let buf = match self.focus {
+        // Send to the focused vim buffer. If it returns false, the key is a
+        // normal-mode app-level verb (q quit, y yank, <space> leader).
+        let buf = self.focused_buf();
+        let consumed = buf.input(k);
+        if !consumed {
+            self.handle_app_verb(k);
+        }
+    }
+
+    fn handle_app_verb(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
+            self.quit = true;
+        }
+        // y and <space> wired up in the yank-verb step.
+    }
+
+    fn focused_buf(&mut self) -> &mut VimBuffer<'a> {
+        match self.focus {
             Pane::Did => &mut self.did_buf,
             Pane::Planning => &mut self.planning_buf,
-        };
-        // Ctrl+Backspace → delete previous word (must also be preserved in vim insert mode).
-        if k.code == KeyCode::Backspace && k.modifiers.contains(M::CONTROL) {
-            buf.delete_word();
-            return;
         }
-        buf.input(k);
+    }
+
+    fn focused_mode(&self) -> Mode {
+        match self.focus {
+            Pane::Did => self.did_buf.mode,
+            Pane::Planning => self.planning_buf.mode,
+        }
     }
 
     fn refresh_styles(&mut self) {
         let did_title = format!(" Yesterday ({}) — what I did ", self.yesterday);
         let planning_title = format!(" Today ({}) — planning ", self.today);
-        apply_focus(&mut self.did_buf, did_title, self.focus == Pane::Did);
-        apply_focus(&mut self.planning_buf, planning_title, self.focus == Pane::Planning);
+        apply_focus(
+            &mut self.did_buf.area,
+            did_title,
+            self.focus == Pane::Did,
+            self.did_buf.mode,
+        );
+        apply_focus(
+            &mut self.planning_buf.area,
+            planning_title,
+            self.focus == Pane::Planning,
+            self.planning_buf.mode,
+        );
     }
 
     fn draw(&self, f: &mut Frame) {
@@ -140,8 +170,8 @@ impl<'a> App<'a> {
             .split(rows[0]);
 
         self.draw_yesterday_planning(f, top[0]);
-        f.render_widget(&self.did_buf, top[1]);
-        f.render_widget(&self.planning_buf, rows[1]);
+        f.render_widget(&self.did_buf.area, top[1]);
+        f.render_widget(&self.planning_buf.area, rows[1]);
 
         self.draw_status(f, chunks[2]);
     }
@@ -170,17 +200,32 @@ impl<'a> App<'a> {
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
-        let hint = " Tab: switch pane    Ctrl-Q: quit (saves) ";
-        let status = Paragraph::new(Line::from(hint))
-            .style(Style::default().fg(Color::DarkGray));
-        f.render_widget(status, area);
+        let mode = self.focused_mode();
+        let (mode_fg, mode_bg) = match mode {
+            Mode::Normal => (Color::Black, Color::Green),
+            Mode::Insert => (Color::Black, Color::Yellow),
+        };
+        let hint = match mode {
+            Mode::Normal => " i/a/o: insert    hjkl/w/b/e/0/$: move    gg/G: top/bot    dd/cc/D/C/x: delete    u/Ctrl-R: undo    Tab: switch    q: quit ",
+            Mode::Insert => " Esc/jj: normal    Ctrl-Backspace: delete word    Tab: switch ",
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {} ", mode.label()),
+                Style::default()
+                    .fg(mode_fg)
+                    .bg(mode_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
     }
 
     fn persist(&mut self) -> Result<()> {
-        let did = collect_bullets(&self.did_buf);
-        let planning = collect_bullets(&self.planning_buf);
+        let did = collect_bullets(&self.did_buf.area);
+        let planning = collect_bullets(&self.planning_buf.area);
 
-        // Yesterday's `did`. Update in place; only insert an entry if non-empty.
         if did.is_empty() {
             if let Some(e) = self.store.entries.get_mut(&self.yesterday) {
                 e.did.clear();
@@ -189,7 +234,6 @@ impl<'a> App<'a> {
             self.store.entry_mut(self.yesterday).did = did;
         }
 
-        // Today's `planning`.
         if planning.is_empty() {
             if let Some(e) = self.store.entries.get_mut(&self.today) {
                 e.planning.clear();
@@ -213,7 +257,7 @@ fn make_textarea<'a>(lines: Vec<String>) -> TextArea<'a> {
     buf
 }
 
-fn apply_focus(buf: &mut TextArea<'_>, title: String, focused: bool) {
+fn apply_focus(buf: &mut TextArea<'_>, title: String, focused: bool, mode: Mode) {
     let border = if focused { Color::Yellow } else { Color::DarkGray };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -221,8 +265,16 @@ fn apply_focus(buf: &mut TextArea<'_>, title: String, focused: bool) {
         .title(title);
     buf.set_block(block);
     buf.set_cursor_line_style(Style::default());
+    // Line numbers act as our trailing-blank indicator: empty lines past the
+    // last bullet still show a number.
+    buf.set_line_number_style(Style::default().fg(Color::DarkGray));
     if focused {
-        buf.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        // Block cursor in normal mode, thin underline in insert mode.
+        let style = match mode {
+            Mode::Normal => Style::default().add_modifier(Modifier::REVERSED),
+            Mode::Insert => Style::default().add_modifier(Modifier::UNDERLINED),
+        };
+        buf.set_cursor_style(style);
     } else {
         buf.set_cursor_style(Style::default());
     }
