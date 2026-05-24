@@ -1,8 +1,10 @@
 mod app;
 mod clipboard;
+mod config;
 mod format;
 mod help;
 mod history;
+mod settings;
 mod storage;
 mod vim;
 

@@ -17,8 +17,9 @@ use ratatui::{
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
-    clipboard, format,
+    clipboard, config, format,
     history::{HistoryAction, HistoryState},
+    settings::{SettingsAction, SettingsState},
     storage::{self, Store, previous_workday},
     vim::{Mode, VimBuffer},
 };
@@ -39,6 +40,7 @@ enum Pending {
 enum Screen {
     Today,
     History,
+    Settings,
 }
 
 pub struct App<'a> {
@@ -66,6 +68,8 @@ pub struct App<'a> {
     screen: Screen,
     history: HistoryState,
     help_open: bool,
+    config_path: PathBuf,
+    settings_state: SettingsState,
 }
 
 const STATUS_MSG_DURATION: Duration = Duration::from_secs(2);
@@ -82,6 +86,9 @@ impl<'a> App<'a> {
 
         let did_buf = VimBuffer::new(make_textarea(did_lines));
         let planning_buf = VimBuffer::new(make_textarea(planning_lines));
+
+        let config_path = config::default_path()?;
+        let settings = config::load(&config_path)?;
 
         let mut app = Self {
             path,
@@ -101,6 +108,8 @@ impl<'a> App<'a> {
             screen: Screen::Today,
             history: HistoryState::new(today),
             help_open: false,
+            config_path,
+            settings_state: SettingsState::new(settings),
         };
         app.refresh_styles();
         Ok(app)
@@ -193,7 +202,49 @@ impl<'a> App<'a> {
         match self.screen {
             Screen::Today => self.handle_today_key(k),
             Screen::History => self.handle_history_key(k),
+            Screen::Settings => self.handle_settings_key(k),
         }
+    }
+
+    fn handle_settings_key(&mut self, k: KeyEvent) {
+        // `?` opens help without leaving the settings screen — but only while
+        // not editing a field, where it would otherwise be typed.
+        if k.code == KeyCode::Char('?')
+            && k.modifiers.is_empty()
+            && !self.settings_state.editing()
+            && self.settings_state.ex_command.is_none()
+        {
+            self.help_open = true;
+            return;
+        }
+        let action = self.settings_state.handle_key(k);
+        match action {
+            SettingsAction::None => {}
+            SettingsAction::Save => self.save_settings(),
+            SettingsAction::Close { save } => {
+                if save && self.settings_state.dirty() {
+                    self.save_settings();
+                }
+                self.screen = Screen::Today;
+            }
+        }
+    }
+
+    fn save_settings(&mut self) {
+        match config::save(&self.config_path, &self.settings_state.settings) {
+            Ok(()) => {
+                self.settings_state.mark_clean();
+                self.set_status("settings saved");
+            }
+            Err(e) => self.set_status(format!("E: settings save failed: {e}")),
+        }
+    }
+
+    fn open_settings(&mut self) {
+        // Reload from disk so the user sees the canonical persisted state.
+        let settings = config::load(&self.config_path).unwrap_or_default();
+        self.settings_state = SettingsState::new(settings);
+        self.screen = Screen::Settings;
     }
 
     fn handle_history_key(&mut self, k: KeyEvent) {
@@ -280,6 +331,7 @@ impl<'a> App<'a> {
             (Pending::Yank, KeyCode::Char('d')) => self.yank_did(),
             (Pending::Yank, KeyCode::Char('p')) => self.yank_planning(),
             (Pending::Leader, KeyCode::Char('h')) => self.open_history(),
+            (Pending::Leader, KeyCode::Char('s')) => self.open_settings(),
             (Pending::Leader, KeyCode::Char('?')) => self.help_open = true,
             _ => {}
         }
@@ -451,6 +503,7 @@ impl<'a> App<'a> {
         match self.screen {
             Screen::Today => self.draw_today(f, chunks[1]),
             Screen::History => self.history.draw(f, chunks[1], &self.store),
+            Screen::Settings => self.settings_state.draw(f, chunks[1]),
         }
 
         self.draw_status(f, chunks[2]);
@@ -553,6 +606,16 @@ impl<'a> App<'a> {
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
+        // Settings screen has its own ex-command line; check first since the
+        // app-level ex line is only set on the today screen.
+        if self.screen == Screen::Settings {
+            if let Some(cmd) = &self.settings_state.ex_command {
+                let line = Line::from(format!(":{cmd}"));
+                f.render_widget(Paragraph::new(line), area);
+                f.set_cursor_position((area.x + 1 + cmd.len() as u16, area.y));
+                return;
+            }
+        }
         // Ex command line takes priority over mode/hint display.
         if let Some(cmd) = &self.ex_command {
             let line = Line::from(format!(":{cmd}"));
@@ -596,7 +659,7 @@ impl<'a> App<'a> {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        " h: history    (any other key cancels) ",
+                        " h: history    s: settings    (any other key cancels) ",
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]);
@@ -604,6 +667,31 @@ impl<'a> App<'a> {
                 return;
             }
             None => {}
+        }
+        if self.screen == Screen::Settings {
+            let mode = self.settings_state.mode_label();
+            let (mode_fg, mode_bg) = if mode == "EDIT" {
+                (Color::Black, Color::Yellow)
+            } else {
+                (Color::Black, Color::Cyan)
+            };
+            let hint = if mode == "EDIT" {
+                " Esc/Enter exit edit    Ctrl-Bksp del word "
+            } else {
+                " j/k move    h back    l/Enter enter/edit    Space toggle    Esc save+close    :w save    ?: keybinds "
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {mode} "),
+                    Style::default()
+                        .fg(mode_fg)
+                        .bg(mode_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
         }
         if self.screen == Screen::History {
             let mut spans = vec![
