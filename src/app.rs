@@ -21,6 +21,7 @@ use tokio::runtime::Handle;
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
+    calendar::{self, RawVevent},
     clipboard, config,
     context::{ContextState, GitlabPaneStatus, Tab as ContextTab},
     format,
@@ -63,6 +64,8 @@ pub enum AppEvent {
         date: NaiveDate,
         result: std::result::Result<Vec<RawEvent>, String>,
     },
+    /// Calendar feed fetched (or failed).
+    CalendarFetched(std::result::Result<Vec<RawVevent>, String>),
 }
 
 struct GitlabCacheEntry {
@@ -74,6 +77,9 @@ struct GitlabCacheEntry {
 const GITLAB_TTL: Duration = Duration::from_secs(30 * 60);
 /// Workdays before today to optimistically prefetch on startup.
 const GITLAB_PREFETCH_DAYS: usize = 7;
+/// How long the calendar feed is considered fresh in-session. Cold start
+/// always fetches because the in-memory cache is empty.
+const CALENDAR_TTL: Duration = Duration::from_secs(15 * 60);
 
 pub struct App<'a> {
     path: PathBuf,
@@ -114,6 +120,11 @@ pub struct App<'a> {
     gitlab_errors: BTreeMap<NaiveDate, String>,
     gitlab_in_flight: std::collections::HashSet<NaiveDate>,
     gitlab_resolve_in_flight: bool,
+    calendar_client: Option<calendar::Client>,
+    calendar_raws: Option<Vec<RawVevent>>,
+    calendar_fetched_at: Option<Instant>,
+    calendar_error: Option<String>,
+    calendar_in_flight: bool,
     context_state: ContextState,
 }
 
@@ -175,10 +186,16 @@ impl<'a> App<'a> {
             gitlab_errors: BTreeMap::new(),
             gitlab_in_flight: Default::default(),
             gitlab_resolve_in_flight: false,
+            calendar_client: None,
+            calendar_raws: None,
+            calendar_fetched_at: None,
+            calendar_error: None,
+            calendar_in_flight: false,
             context_state: ContextState::new(initial_tab),
         };
         app.refresh_styles();
         app.init_gitlab();
+        app.init_calendar();
         Ok(app)
     }
 
@@ -278,6 +295,22 @@ impl<'a> App<'a> {
                     }
                 }
             }
+            AppEvent::CalendarFetched(result) => {
+                self.calendar_in_flight = false;
+                match result {
+                    Ok(raws) => {
+                        let n = raws.len();
+                        self.calendar_raws = Some(raws);
+                        self.calendar_fetched_at = Some(Instant::now());
+                        self.calendar_error = None;
+                        self.set_status(format!("calendar: {n} events"));
+                    }
+                    Err(e) => {
+                        self.set_status(format!("E: calendar fetch: {e}"));
+                        self.calendar_error = Some(e);
+                    }
+                }
+            }
         }
     }
 
@@ -351,23 +384,87 @@ impl<'a> App<'a> {
         });
     }
 
+    /// Build a calendar client from current settings (or clear it) and kick
+    /// off an initial fetch. Called at startup and after settings save.
+    fn init_calendar(&mut self) {
+        let cfg = &self.settings_state.settings.calendar;
+        if !cfg.enabled || cfg.ics_url.trim().is_empty() {
+            self.calendar_client = None;
+            self.calendar_raws = None;
+            self.calendar_fetched_at = None;
+            self.calendar_error = None;
+            return;
+        }
+        let client = match calendar::Client::new(&cfg.ics_url) {
+            Ok(c) => c,
+            Err(e) => {
+                self.set_status(format!("E: calendar client: {e}"));
+                return;
+            }
+        };
+        self.calendar_client = Some(client);
+        self.fetch_calendar(true);
+    }
+
+    /// Fetch the calendar feed. Skips if a fetch is in flight or the cached
+    /// data is still fresh (unless `force`).
+    fn fetch_calendar(&mut self, force: bool) {
+        let Some(client) = self.calendar_client.clone() else {
+            return;
+        };
+        if self.calendar_in_flight {
+            return;
+        }
+        if !force {
+            if let Some(at) = self.calendar_fetched_at {
+                if at.elapsed() < CALENDAR_TTL {
+                    return;
+                }
+            }
+        }
+        self.calendar_in_flight = true;
+        let tx = self.event_tx.clone();
+        self.runtime.spawn(async move {
+            let result = client.fetch().await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::CalendarFetched(result));
+        });
+    }
+
     /// Refresh GitLab events for the date currently summarised (yesterday of
-    /// the viewing date). Triggered by `<Space>r`.
+    /// the viewing date). Triggered by `<Space>r` together with calendar.
     fn refresh_gitlab(&mut self) {
         if self.gitlab_client.is_none() {
-            self.set_status("gitlab not configured");
             return;
         }
         if self.gitlab_user_id.is_none() {
             if !self.gitlab_resolve_in_flight {
                 self.init_gitlab();
             }
-            self.set_status("gitlab: resolving user...");
             return;
         }
         let target = previous_workday(self.viewing_date);
         self.fetch_for_date(target, true);
-        self.set_status(format!("gitlab: refreshing {target}"));
+    }
+
+    /// Refresh both integrations. The `<Space>r` keybinding always triggers
+    /// this regardless of which context tab is visible.
+    fn refresh_integrations(&mut self) {
+        let gitlab_configured = self.gitlab_client.is_some();
+        let calendar_configured = self.calendar_client.is_some();
+        if !gitlab_configured && !calendar_configured {
+            self.set_status("no integrations configured");
+            return;
+        }
+        self.refresh_gitlab();
+        self.fetch_calendar(true);
+        let mut parts = Vec::new();
+        if gitlab_configured {
+            parts.push("gitlab");
+        }
+        if calendar_configured {
+            parts.push("calendar");
+        }
+        self.set_status(format!("refreshing {}", parts.join(" + ")));
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -436,8 +533,9 @@ impl<'a> App<'a> {
             Ok(()) => {
                 self.settings_state.mark_clean();
                 self.set_status("settings saved");
-                // Re-evaluate gitlab integration in case its config changed.
+                // Re-evaluate both integrations in case their config changed.
                 self.init_gitlab();
+                self.init_calendar();
             }
             Err(e) => self.set_status(format!("E: settings save failed: {e}")),
         }
@@ -608,7 +706,7 @@ impl<'a> App<'a> {
             (Pending::Yank, KeyCode::Char('p')) => self.yank_planning(),
             (Pending::Leader, KeyCode::Char('h')) => self.open_history(),
             (Pending::Leader, KeyCode::Char('s')) => self.open_settings(),
-            (Pending::Leader, KeyCode::Char('r')) => self.refresh_gitlab(),
+            (Pending::Leader, KeyCode::Char('r')) => self.refresh_integrations(),
             (Pending::Leader, KeyCode::Char('?')) => self.help_open = true,
             _ => {}
         }
@@ -949,7 +1047,7 @@ impl<'a> App<'a> {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        " h: history    s: settings    r: refresh gitlab    (any other key cancels) ",
+                        " h: history    s: settings    r: refresh integrations    (any other key cancels) ",
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]);

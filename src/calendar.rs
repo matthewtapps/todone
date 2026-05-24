@@ -282,6 +282,21 @@ fn cdt_to_local(cdt: &CalendarDateTime) -> Option<DateTime<Local>> {
     }
 }
 
+/// Convenience for the renderer: materialise just the instances that fall on
+/// `date` (local time), sorted by start. Recurrence expansion is bounded to
+/// that single day so it stays cheap.
+pub fn events_for_date(raws: &[RawVevent], date: NaiveDate) -> Vec<CalendarEvent> {
+    let Some(start) = local_midnight(date) else {
+        return Vec::new();
+    };
+    let Some(end) = date.succ_opt().and_then(local_midnight) else {
+        return Vec::new();
+    };
+    let mut events = materialize(raws, start, end);
+    events.sort_by_key(|e| (e.start, e.end));
+    events
+}
+
 /// Filter `events` to those whose `[start, end)` interval overlaps `date` in
 /// local time. Multi-day events show up on every day they cover.
 pub fn events_on<'a>(events: &'a [CalendarEvent], date: NaiveDate) -> Vec<&'a CalendarEvent> {
