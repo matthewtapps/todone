@@ -472,8 +472,35 @@ impl<'a> App<'a> {
             .split(rows[0]);
 
         self.draw_yesterday_planning(f, top[0]);
-        f.render_widget(&self.did_buf.area, top[1]);
-        f.render_widget(&self.planning_buf.area, rows[1]);
+        self.draw_buffer(f, top[1], &self.did_buf, self.focus == Pane::Did);
+        self.draw_buffer(f, rows[1], &self.planning_buf, self.focus == Pane::Planning);
+    }
+
+    /// Focused pane renders the live `TextArea` (horizontal scroll, cursor).
+    /// Unfocused pane renders the same content as a wrapped `Paragraph` with
+    /// a hanging indent on continuation lines.
+    fn draw_buffer(&self, f: &mut Frame, area: Rect, buf: &VimBuffer<'_>, focused: bool) {
+        if focused {
+            f.render_widget(&buf.area, area);
+            return;
+        }
+        let block = buf.area.block().cloned();
+        let inner_width = block
+            .as_ref()
+            .map(|b| b.inner(area).width)
+            .unwrap_or(area.width) as usize;
+        let body: Vec<Line> = buf
+            .area
+            .lines()
+            .iter()
+            .flat_map(|l| wrap_with_hang(l, inner_width, 2))
+            .map(Line::from)
+            .collect();
+        let mut p = Paragraph::new(body);
+        if let Some(b) = block {
+            p = p.block(b);
+        }
+        f.render_widget(p, area);
     }
 
     fn draw_yesterday_planning(&self, f: &mut Frame, area: Rect) {
@@ -692,6 +719,48 @@ fn apply_focus(buf: &mut TextArea<'_>, title: String, focused: bool, mode: Mode)
     } else {
         buf.set_cursor_style(Style::default());
     }
+}
+
+/// Word-wrap `text` to `width`, prepending `indent_spaces` spaces on every line
+/// after the first. Whitespace inside `text` is collapsed to single spaces.
+fn wrap_with_hang(text: &str, width: usize, indent_spaces: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let indent: String = " ".repeat(indent_spaces);
+    let cont_width = width.saturating_sub(indent_spaces).max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let avail = if lines.is_empty() { width } else { cont_width };
+        let word_len = word.chars().count();
+        let current_len = current.chars().count();
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current_len + 1 + word_len <= avail {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(if lines.is_empty() {
+                std::mem::take(&mut current)
+            } else {
+                format!("{indent}{}", std::mem::take(&mut current))
+            });
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(if lines.is_empty() {
+            current
+        } else {
+            format!("{indent}{current}")
+        });
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn collect_bullets(buf: &TextArea<'_>) -> Vec<String> {
