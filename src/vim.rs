@@ -203,6 +203,8 @@ impl<'a> VimBuffer<'a> {
                     | KeyCode::Char(':')
                     | KeyCode::Char('<')
                     | KeyCode::Char('>')
+                    | KeyCode::Char('[')
+                    | KeyCode::Char(']')
                     | KeyCode::Char('?')
             ) {
                 return false;

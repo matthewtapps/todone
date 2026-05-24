@@ -53,6 +53,8 @@ fn content() -> Vec<Line<'static>> {
         row("D  C", "delete / change to end of line"),
         row("u  Ctrl-R", "undo / redo"),
         row("Tab", "switch pane (yesterday-did ↔ today-planning)"),
+        row("Ctrl-h/j/k/l", "focus pane left / down / up / right"),
+        row("[  ]", "previous / next context tab (planning / gitlab)"),
         row("</>", "previous / next day"),
         row("q", "quit (saves)"),
         Line::from(""),

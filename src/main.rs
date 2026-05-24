@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod config;
+mod context;
 mod format;
 mod gitlab;
 mod help;

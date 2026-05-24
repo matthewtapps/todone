@@ -21,7 +21,9 @@ use tokio::runtime::Handle;
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
-    clipboard, config, format,
+    clipboard, config,
+    context::{ContextState, GitlabPaneStatus, Tab as ContextTab},
+    format,
     gitlab::{self, RawEvent},
     history::{HistoryAction, HistoryState},
     settings::{SettingsAction, SettingsState},
@@ -33,6 +35,7 @@ use crate::{
 enum Pane {
     Did,
     Planning,
+    Context,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +54,8 @@ enum Screen {
 /// Events flowing into the main loop from input and background tasks.
 pub enum AppEvent {
     Input(KeyEvent),
+    /// Terminal was resized — wake the loop so it redraws at the new size.
+    Resize,
     /// User lookup completed.
     GitlabUserResolved(std::result::Result<u64, String>),
     /// One date's events fetched (or failed).
@@ -83,6 +88,9 @@ pub struct App<'a> {
     did_buf: VimBuffer<'a>,
     planning_buf: VimBuffer<'a>,
     focus: Pane,
+    /// Last editable pane the focus was on — used when leaving the context
+    /// pane upward, so `Ctrl-K` lands you back where you were.
+    last_editable: Pane,
     quit: bool,
     /// `Some` when the user is mid-`:command` entry, contains the typed text so far.
     ex_command: Option<String>,
@@ -103,8 +111,10 @@ pub struct App<'a> {
     gitlab_client: Option<gitlab::Client>,
     gitlab_user_id: Option<u64>,
     gitlab_cache: BTreeMap<NaiveDate, GitlabCacheEntry>,
+    gitlab_errors: BTreeMap<NaiveDate, String>,
     gitlab_in_flight: std::collections::HashSet<NaiveDate>,
     gitlab_resolve_in_flight: bool,
+    context_state: ContextState,
 }
 
 const STATUS_MSG_DURATION: Duration = Duration::from_secs(2);
@@ -125,6 +135,14 @@ impl<'a> App<'a> {
         let config_path = config::default_path()?;
         let settings = config::load(&config_path)?;
 
+        // Default to the GitLab tab when the user has set up the integration —
+        // it's the more valuable context once configured.
+        let initial_tab = if settings.gitlab.enabled {
+            ContextTab::Gitlab
+        } else {
+            ContextTab::Planning
+        };
+
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
 
         let mut app = Self {
@@ -137,6 +155,7 @@ impl<'a> App<'a> {
             did_buf,
             planning_buf,
             focus: Pane::Did,
+            last_editable: Pane::Did,
             quit: false,
             ex_command: None,
             status_msg: None,
@@ -153,8 +172,10 @@ impl<'a> App<'a> {
             gitlab_client: None,
             gitlab_user_id: None,
             gitlab_cache: BTreeMap::new(),
+            gitlab_errors: BTreeMap::new(),
             gitlab_in_flight: Default::default(),
             gitlab_resolve_in_flight: false,
+            context_state: ContextState::new(initial_tab),
         };
         app.refresh_styles();
         app.init_gitlab();
@@ -220,6 +241,9 @@ impl<'a> App<'a> {
     fn handle_event(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::Input(k) => self.handle_key(k),
+            AppEvent::Resize => {
+                // No state change; the next draw uses the new terminal size.
+            }
             AppEvent::GitlabUserResolved(result) => {
                 self.gitlab_resolve_in_flight = false;
                 match result {
@@ -246,8 +270,12 @@ impl<'a> App<'a> {
                             date,
                             GitlabCacheEntry { events, fetched_at: Instant::now() },
                         );
+                        self.gitlab_errors.remove(&date);
                     }
-                    Err(e) => self.set_status(format!("E: gitlab fetch {date}: {e}")),
+                    Err(e) => {
+                        self.set_status(format!("E: gitlab fetch {date}: {e}"));
+                        self.gitlab_errors.insert(date, e);
+                    }
                 }
             }
         }
@@ -446,12 +474,43 @@ impl<'a> App<'a> {
             self.handle_pending(p, k);
             return;
         }
-        // Tab switches panes. Always wins; we don't put Tab characters in bullets.
+        // Ctrl + hjkl: directional pane focus. Handled before vim because
+        // these are always app-level navigation regardless of editor mode.
+        if k.modifiers.contains(M::CONTROL) {
+            match k.code {
+                KeyCode::Char('h') => {
+                    self.focus_left();
+                    return;
+                }
+                KeyCode::Char('j') => {
+                    self.focus_down();
+                    return;
+                }
+                KeyCode::Char('k') => {
+                    self.focus_up();
+                    return;
+                }
+                KeyCode::Char('l') => {
+                    self.focus_right();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Tab toggles between the two editable panes. From the context pane,
+        // it returns to the last editable focus.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
             self.focus = match self.focus {
                 Pane::Did => Pane::Planning,
                 Pane::Planning => Pane::Did,
+                Pane::Context => self.last_editable,
             };
+            self.remember_focus();
+            return;
+        }
+        // From the context pane there's no editor — every key is app-level.
+        if self.focus == Pane::Context {
+            self.handle_app_verb(k);
             return;
         }
         // Send to the focused vim buffer. If it returns false, the key is a
@@ -460,6 +519,40 @@ impl<'a> App<'a> {
         let consumed = buf.input(k);
         if !consumed {
             self.handle_app_verb(k);
+        }
+    }
+
+    fn remember_focus(&mut self) {
+        if matches!(self.focus, Pane::Did | Pane::Planning) {
+            self.last_editable = self.focus;
+        }
+    }
+
+    fn focus_left(&mut self) {
+        self.focus = match self.focus {
+            Pane::Planning => Pane::Did,
+            other => other, // Did stays, Context stays (no "left of" context)
+        };
+        self.remember_focus();
+    }
+
+    fn focus_right(&mut self) {
+        self.focus = match self.focus {
+            Pane::Did => Pane::Planning,
+            other => other,
+        };
+        self.remember_focus();
+    }
+
+    fn focus_down(&mut self) {
+        if matches!(self.focus, Pane::Did | Pane::Planning) {
+            self.focus = Pane::Context;
+        }
+    }
+
+    fn focus_up(&mut self) {
+        if self.focus == Pane::Context {
+            self.focus = self.last_editable;
         }
     }
 
@@ -490,6 +583,14 @@ impl<'a> App<'a> {
         }
         if plain_or_shift && k.code == KeyCode::Char('>') {
             self.navigate_days(1);
+            return;
+        }
+        if plain_or_shift && k.code == KeyCode::Char('[') {
+            self.context_state.cycle(-1);
+            return;
+        }
+        if plain_or_shift && k.code == KeyCode::Char(']') {
+            self.context_state.cycle(1);
             return;
         }
         if plain_or_shift && k.code == KeyCode::Char('?') {
@@ -635,6 +736,9 @@ impl<'a> App<'a> {
         match self.focus {
             Pane::Did => &mut self.did_buf,
             Pane::Planning => &mut self.planning_buf,
+            // Defensive: callers should check focus first; return did to avoid
+            // panicking if a code path forgets.
+            Pane::Context => &mut self.did_buf,
         }
     }
 
@@ -642,6 +746,7 @@ impl<'a> App<'a> {
         match self.focus {
             Pane::Did => self.did_buf.mode,
             Pane::Planning => self.planning_buf.mode,
+            Pane::Context => Mode::Normal,
         }
     }
 
@@ -700,9 +805,38 @@ impl<'a> App<'a> {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(rows[0]);
 
-        self.draw_yesterday_planning(f, top[0]);
-        self.draw_buffer(f, top[1], &self.did_buf, self.focus == Pane::Did);
-        self.draw_buffer(f, rows[1], &self.planning_buf, self.focus == Pane::Planning);
+        // Top: the two editable buffers side-by-side. Bottom: full-width
+        // context pane (yesterday-planning + gitlab activity).
+        self.draw_buffer(f, top[0], &self.did_buf, self.focus == Pane::Did);
+        self.draw_buffer(f, top[1], &self.planning_buf, self.focus == Pane::Planning);
+        self.draw_context_pane(f, rows[1]);
+    }
+
+    fn draw_context_pane(&self, f: &mut Frame, area: Rect) {
+        let status = if self.gitlab_client.is_none() {
+            GitlabPaneStatus::Disabled
+        } else if let Some(entry) = self.gitlab_cache.get(&self.yesterday) {
+            GitlabPaneStatus::Events(&entry.events)
+        } else if let Some(err) = self.gitlab_errors.get(&self.yesterday) {
+            GitlabPaneStatus::Error(err)
+        } else if self.gitlab_in_flight.contains(&self.yesterday)
+            || self.gitlab_resolve_in_flight
+        {
+            GitlabPaneStatus::Loading
+        } else {
+            // Configured but not yet fetched — kick a fetch off and show
+            // loading. Avoid the empty-state showing on first frame.
+            GitlabPaneStatus::Loading
+        };
+        crate::context::draw(
+            f,
+            area,
+            &self.context_state,
+            self.yesterday,
+            &self.yesterday_planning,
+            status,
+            self.focus == Pane::Context,
+        );
     }
 
     /// Focused pane renders the live `TextArea` (horizontal scroll, cursor).
@@ -729,26 +863,6 @@ impl<'a> App<'a> {
         if let Some(b) = block {
             p = p.block(b);
         }
-        f.render_widget(p, area);
-    }
-
-    fn draw_yesterday_planning(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(format!(
-                " Yesterday — {} — planning (ref) ",
-                format_date_short(self.yesterday)
-            ));
-        let body = if self.yesterday_planning.is_empty() {
-            vec![Line::from("(no planning recorded)").style(Style::default().fg(Color::DarkGray))]
-        } else {
-            self.yesterday_planning
-                .iter()
-                .map(|b| Line::from(format!("- {b}")))
-                .collect()
-        };
-        let p = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
         f.render_widget(p, area);
     }
 
@@ -894,14 +1008,31 @@ impl<'a> App<'a> {
             f.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
+        if self.focus == Pane::Context {
+            let line = Line::from(vec![
+                Span::styled(
+                    " CONTEXT ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " [ ] switch tab    Ctrl-K back to editor    </> day    q quit ",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
         let mode = self.focused_mode();
         let (mode_fg, mode_bg) = match mode {
             Mode::Normal => (Color::Black, Color::Green),
             Mode::Insert => (Color::Black, Color::Yellow),
         };
         let hint = match mode {
-            Mode::Normal => " i insert    </> day    y yank    <space>h history    ?: keybinds    q quit ",
-            Mode::Insert => " Esc/jj normal    Tab switch    ?: keybinds ",
+            Mode::Normal => " i insert    </> day    Ctrl-hjkl pane    y yank    <space>h history    ?: keybinds    q quit ",
+            Mode::Insert => " Esc/jj normal    Tab switch    Ctrl-hjkl pane    ?: keybinds ",
         };
         let line = Line::from(vec![
             Span::styled(
@@ -985,17 +1116,18 @@ fn apply_focus(buf: &mut TextArea<'_>, title: String, focused: bool, mode: Mode)
     }
 }
 
-/// Spawn a daemon thread that forwards crossterm key presses onto `tx`. The
+/// Spawn a daemon thread that forwards crossterm input events onto `tx`. The
 /// thread exits when the channel is dropped (i.e. on app shutdown).
 fn spawn_input_thread(tx: mpsc::Sender<AppEvent>) {
     thread::spawn(move || loop {
         let Ok(ev) = event::read() else { return };
-        if let Event::Key(k) = ev {
-            if k.kind == KeyEventKind::Press {
-                if tx.send(AppEvent::Input(k)).is_err() {
-                    return;
-                }
-            }
+        let app_ev = match ev {
+            Event::Key(k) if k.kind == KeyEventKind::Press => AppEvent::Input(k),
+            Event::Resize(_, _) => AppEvent::Resize,
+            _ => continue,
+        };
+        if tx.send(app_ev).is_err() {
+            return;
         }
     });
 }
