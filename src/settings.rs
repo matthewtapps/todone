@@ -295,6 +295,11 @@ impl SettingsState {
         let fields = section_fields(section);
         let label_width = fields.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
 
+        // Prefix layout: " M " (3) + "label<padded><label_width>" + "  " (2) = value start col
+        let marker_prefix_chars = 3usize;
+        let value_start_col = marker_prefix_chars + label_width + 2;
+        let mut editing_value_len: Option<usize> = None;
+
         let items: Vec<Line> = fields
             .iter()
             .enumerate()
@@ -313,19 +318,28 @@ impl SettingsState {
                     FieldKind::Secret if !(editing && focused) => "•".repeat(raw.chars().count()),
                     _ => raw,
                 };
-                let value_style = if editing && focused {
-                    Style::default().fg(Color::Black).bg(Color::Yellow)
-                } else {
-                    Style::default()
-                };
+                if editing && focused {
+                    editing_value_len = Some(display.chars().count());
+                }
                 Line::from(vec![
                     Span::styled(format!(" {marker} "), label_style),
                     Span::styled(format!("{label:<label_width$}  "), label_style),
-                    Span::styled(display, value_style),
+                    Span::raw(display),
                 ])
             })
             .collect();
         f.render_widget(Paragraph::new(items), inner);
+
+        // Place the terminal cursor at the end of the value being edited so
+        // the user has a clear "where I'm typing" indicator — without this an
+        // empty field gives no signal that edit mode is active.
+        if let Some(value_len) = editing_value_len {
+            let x = inner.x + value_start_col as u16 + value_len as u16;
+            let y = inner.y + cursor as u16;
+            if x < inner.x + inner.width && y < inner.y + inner.height {
+                f.set_cursor_position((x, y));
+            }
+        }
     }
 }
 
