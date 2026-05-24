@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
 use tui_textarea::{CursorMove, TextArea};
 
@@ -24,11 +26,25 @@ enum Pending {
     C,
 }
 
+/// Max gap between two `j` presses for them to be treated as `<Esc>` in insert mode.
+const JJ_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Clone)]
+struct Snapshot {
+    lines: Vec<String>,
+    cursor: (usize, usize),
+}
+
 pub struct VimBuffer<'a> {
     pub area: TextArea<'a>,
     pub mode: Mode,
     pending: Pending,
-    last_insert_was_j: bool,
+    last_j_at: Option<Instant>,
+    pub jj_timeout: Duration,
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
+    /// Snapshot taken when entering insert mode; committed to undo on Esc.
+    pre_insert: Option<Snapshot>,
 }
 
 impl<'a> VimBuffer<'a> {
@@ -37,7 +53,67 @@ impl<'a> VimBuffer<'a> {
             area,
             mode: Mode::Normal,
             pending: Pending::None,
-            last_insert_was_j: false,
+            last_j_at: None,
+            jj_timeout: JJ_TIMEOUT,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            pre_insert: None,
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            lines: self.area.lines().to_vec(),
+            cursor: self.area.cursor(),
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        let mut area = if s.lines.is_empty() {
+            TextArea::default()
+        } else {
+            TextArea::new(s.lines)
+        };
+        area.move_cursor(CursorMove::Jump(s.cursor.0 as u16, s.cursor.1 as u16));
+        self.area = area;
+    }
+
+    /// Push `prev` to the undo stack if the current buffer differs from it.
+    fn commit(&mut self, prev: Snapshot) {
+        if prev.lines != self.area.lines() {
+            self.undo_stack.push(prev);
+            self.redo_stack.clear();
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(snap) = self.undo_stack.pop() {
+            let current = self.snapshot();
+            self.restore(snap);
+            self.redo_stack.push(current);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(snap) = self.redo_stack.pop() {
+            let current = self.snapshot();
+            self.restore(snap);
+            self.undo_stack.push(current);
+        }
+    }
+
+    fn enter_insert(&mut self) {
+        if self.pre_insert.is_none() {
+            self.pre_insert = Some(self.snapshot());
+        }
+        self.mode = Mode::Insert;
+    }
+
+    fn leave_insert(&mut self) {
+        self.mode = Mode::Normal;
+        self.last_j_at = None;
+        if let Some(snap) = self.pre_insert.take() {
+            self.commit(snap);
         }
     }
 
@@ -64,24 +140,24 @@ impl<'a> VimBuffer<'a> {
 
     fn input_insert(&mut self, k: KeyEvent) {
         if k.code == KeyCode::Esc {
-            self.mode = Mode::Normal;
-            self.last_insert_was_j = false;
+            self.leave_insert();
             return;
         }
-        // Quick `jj` escape: insert the first j, but if the next key is also j,
-        // delete that j and switch to normal mode.
+        // Quick `jj` escape: only triggers when the two j's arrive within JJ_TIMEOUT.
+        // Pause briefly between them to type a literal `jj`.
         if k.code == KeyCode::Char('j') && k.modifiers.is_empty() {
-            if self.last_insert_was_j {
-                self.area.delete_char();
-                self.mode = Mode::Normal;
-                self.last_insert_was_j = false;
-                return;
+            if let Some(t) = self.last_j_at {
+                if t.elapsed() <= self.jj_timeout {
+                    self.area.delete_char();
+                    self.leave_insert();
+                    return;
+                }
             }
-            self.last_insert_was_j = true;
             self.area.input(k);
+            self.last_j_at = Some(Instant::now());
             return;
         }
-        self.last_insert_was_j = false;
+        self.last_j_at = None;
         self.area.input(k);
     }
 
@@ -100,26 +176,31 @@ impl<'a> VimBuffer<'a> {
             Pending::D => {
                 self.pending = Pending::None;
                 if k.code == KeyCode::Char('d') {
+                    let snap = self.snapshot();
                     delete_line(&mut self.area);
+                    self.commit(snap);
                 }
                 return true;
             }
             Pending::C => {
                 self.pending = Pending::None;
                 if k.code == KeyCode::Char('c') {
+                    self.enter_insert();
                     change_line(&mut self.area);
-                    self.mode = Mode::Insert;
                 }
                 return true;
             }
             Pending::None => {}
         }
 
-        // App-level verbs: defer to caller (q=quit, y=yank verb, space=leader).
+        // App-level verbs: defer to caller (q=quit, y=yank verb, space=leader, : =ex command).
         if k.modifiers.is_empty() || k.modifiers == M::SHIFT {
             if matches!(
                 k.code,
-                KeyCode::Char('q') | KeyCode::Char('y') | KeyCode::Char(' ')
+                KeyCode::Char('q')
+                    | KeyCode::Char('y')
+                    | KeyCode::Char(' ')
+                    | KeyCode::Char(':')
             ) {
                 return false;
             }
@@ -144,46 +225,50 @@ impl<'a> VimBuffer<'a> {
                 }
 
                 // Enter insert
-                KeyCode::Char('i') => self.mode = Mode::Insert,
+                KeyCode::Char('i') => self.enter_insert(),
                 KeyCode::Char('I') => {
+                    self.enter_insert();
                     self.area.move_cursor(CursorMove::Head);
-                    self.mode = Mode::Insert;
                 }
                 KeyCode::Char('a') => {
+                    self.enter_insert();
                     self.area.move_cursor(CursorMove::Forward);
-                    self.mode = Mode::Insert;
                 }
                 KeyCode::Char('A') => {
+                    self.enter_insert();
                     self.area.move_cursor(CursorMove::End);
-                    self.mode = Mode::Insert;
                 }
                 KeyCode::Char('o') => {
+                    self.enter_insert();
                     self.area.move_cursor(CursorMove::End);
                     self.area.insert_newline();
-                    self.mode = Mode::Insert;
                 }
                 KeyCode::Char('O') => {
+                    self.enter_insert();
                     self.area.move_cursor(CursorMove::Head);
                     self.area.insert_newline();
                     self.area.move_cursor(CursorMove::Up);
-                    self.mode = Mode::Insert;
                 }
 
                 // Delete / change
                 KeyCode::Char('x') => {
+                    let snap = self.snapshot();
                     self.area.delete_next_char();
+                    self.commit(snap);
                 }
                 KeyCode::Char('D') => {
+                    let snap = self.snapshot();
                     self.area.delete_line_by_end();
+                    self.commit(snap);
                 }
                 KeyCode::Char('C') => {
+                    self.enter_insert();
                     self.area.delete_line_by_end();
-                    self.mode = Mode::Insert;
                 }
 
                 // Undo
                 KeyCode::Char('u') => {
-                    self.area.undo();
+                    self.undo();
                 }
 
                 // Pending sequences
@@ -198,7 +283,7 @@ impl<'a> VimBuffer<'a> {
 
         if k.modifiers.contains(M::CONTROL) {
             if let KeyCode::Char('r') = k.code {
-                self.area.redo();
+                self.redo();
             }
             return true;
         }
@@ -377,15 +462,48 @@ mod tests {
     }
 
     #[test]
-    fn undo_redo() {
+    fn undo_treats_insert_session_as_one_block() {
         let mut b = buf(&[""]);
-        send(&mut b, &[key('i'), key('a'), key('b'), esc()]);
-        assert_eq!(b.lines()[0], "ab");
-        // tui-textarea records per-keystroke history, so two undos to clear.
-        send(&mut b, &[key('u'), key('u')]);
-        assert_eq!(b.lines()[0], "");
-        send(&mut b, &[ctrl('r'), ctrl('r')]);
-        assert_eq!(b.lines()[0], "ab");
+        send(&mut b, &[key('i'), key('a'), key('b'), key('c'), esc()]);
+        assert_eq!(b.lines()[0], "abc");
+        send(&mut b, &[key('u')]);
+        assert_eq!(b.lines()[0], ""); // single undo wipes the whole "abc"
+        send(&mut b, &[ctrl('r')]);
+        assert_eq!(b.lines()[0], "abc");
+    }
+
+    #[test]
+    fn undo_skips_net_zero_insert_sessions() {
+        // jj-escape inserts then deletes a j; net change is none, so no undo step.
+        let mut b = buf(&["start"]);
+        send(&mut b, &[key('A'), key('!'), esc()]); // append "!" → "start!"
+        send(&mut b, &[key('i'), key('j'), key('j')]); // jj-escape, no change
+        assert_eq!(b.lines()[0], "start!");
+        send(&mut b, &[key('u')]);
+        // Only one undo step exists (for the "!" insert), and it should clear that.
+        assert_eq!(b.lines()[0], "start");
+    }
+
+    #[test]
+    fn undo_normal_mode_edits_each_one_step() {
+        let mut b = buf(&["abc"]);
+        send(&mut b, &[key('x')]); // "bc"
+        send(&mut b, &[key('x')]); // "c"
+        assert_eq!(b.lines()[0], "c");
+        send(&mut b, &[key('u')]);
+        assert_eq!(b.lines()[0], "bc");
+        send(&mut b, &[key('u')]);
+        assert_eq!(b.lines()[0], "abc");
+    }
+
+    #[test]
+    fn redo_is_cleared_by_new_edit() {
+        let mut b = buf(&["abc"]);
+        send(&mut b, &[key('x')]); // "bc"
+        send(&mut b, &[key('u')]); // back to "abc"
+        send(&mut b, &[key('x')]); // "bc" again — should clear redo
+        send(&mut b, &[ctrl('r')]); // nothing to redo
+        assert_eq!(b.lines()[0], "bc");
     }
 
     #[test]

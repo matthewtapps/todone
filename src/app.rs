@@ -34,6 +34,10 @@ pub struct App<'a> {
     planning_buf: VimBuffer<'a>,
     focus: Pane,
     quit: bool,
+    /// `Some` when the user is mid-`:command` entry, contains the typed text so far.
+    ex_command: Option<String>,
+    /// One-line transient message shown in the status bar (e.g. "written").
+    status_msg: Option<String>,
 }
 
 impl<'a> App<'a> {
@@ -71,6 +75,8 @@ impl<'a> App<'a> {
             planning_buf,
             focus: Pane::Did,
             quit: false,
+            ex_command: None,
+            status_msg: None,
         };
         app.refresh_styles();
         Ok(app)
@@ -92,6 +98,13 @@ impl<'a> App<'a> {
 
     fn handle_key(&mut self, k: KeyEvent) {
         use crossterm::event::KeyModifiers as M;
+        // Ex command mode owns all keystrokes until completed or cancelled.
+        if self.ex_command.is_some() {
+            self.handle_ex_key(k);
+            return;
+        }
+        // Any new keystroke clears the previous transient status message.
+        self.status_msg = None;
         // Global: Ctrl-Q quits. Always wins, even in insert mode.
         if k.code == KeyCode::Char('q') && k.modifiers.contains(M::CONTROL) {
             self.quit = true;
@@ -106,7 +119,7 @@ impl<'a> App<'a> {
             return;
         }
         // Send to the focused vim buffer. If it returns false, the key is a
-        // normal-mode app-level verb (q quit, y yank, <space> leader).
+        // normal-mode app-level verb (q quit, y yank, : ex, <space> leader).
         let buf = self.focused_buf();
         let consumed = buf.input(k);
         if !consumed {
@@ -117,8 +130,58 @@ impl<'a> App<'a> {
     fn handle_app_verb(&mut self, k: KeyEvent) {
         if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
             self.quit = true;
+            return;
+        }
+        if k.code == KeyCode::Char(':')
+            && (k.modifiers.is_empty() || k.modifiers == crossterm::event::KeyModifiers::SHIFT)
+        {
+            self.ex_command = Some(String::new());
+            return;
         }
         // y and <space> wired up in the yank-verb step.
+    }
+
+    fn handle_ex_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => {
+                self.ex_command = None;
+            }
+            KeyCode::Enter => {
+                if let Some(cmd) = self.ex_command.take() {
+                    self.execute_ex(&cmd);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(cmd) = self.ex_command.as_mut() {
+                    if cmd.pop().is_none() {
+                        // Backspace on empty ex line cancels (matches vim).
+                        self.ex_command = None;
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(cmd) = self.ex_command.as_mut() {
+                    cmd.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_ex(&mut self, cmd: &str) {
+        match cmd.trim() {
+            "w" => match self.persist() {
+                Ok(()) => self.status_msg = Some("written".to_string()),
+                Err(e) => self.status_msg = Some(format!("E: save failed: {e}")),
+            },
+            "wq" | "x" => match self.persist() {
+                Ok(()) => self.quit = true,
+                Err(e) => self.status_msg = Some(format!("E: save failed: {e}")),
+            },
+            "q" => self.quit = true,
+            "" => {}
+            other => self.status_msg = Some(format!("E: unknown command \"{other}\"")),
+        }
     }
 
     fn focused_buf(&mut self) -> &mut VimBuffer<'a> {
@@ -200,13 +263,28 @@ impl<'a> App<'a> {
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
+        // Ex command line takes priority over mode/hint display.
+        if let Some(cmd) = &self.ex_command {
+            let line = Line::from(format!(":{cmd}"));
+            f.render_widget(Paragraph::new(line), area);
+            f.set_cursor_position((area.x + 1 + cmd.len() as u16, area.y));
+            return;
+        }
+        if let Some(msg) = &self.status_msg {
+            let line = Line::from(Span::styled(
+                msg.as_str(),
+                Style::default().fg(Color::Yellow),
+            ));
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
         let mode = self.focused_mode();
         let (mode_fg, mode_bg) = match mode {
             Mode::Normal => (Color::Black, Color::Green),
             Mode::Insert => (Color::Black, Color::Yellow),
         };
         let hint = match mode {
-            Mode::Normal => " i/a/o: insert    hjkl/w/b/e/0/$: move    gg/G: top/bot    dd/cc/D/C/x: delete    u/Ctrl-R: undo    Tab: switch    q: quit ",
+            Mode::Normal => " i/a/o: insert    hjkl/w/b/e/0/$: move    gg/G: top/bot    dd/cc/D/C/x: delete    u/Ctrl-R: undo    Tab: switch    :w/:wq/:q    q: quit ",
             Mode::Insert => " Esc/jj: normal    Ctrl-Backspace: delete word    Tab: switch ",
         };
         let line = Line::from(vec![
