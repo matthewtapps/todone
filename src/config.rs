@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     #[serde(default)]
     pub gitlab: GitlabConfig,
+    #[serde(default)]
+    pub calendar: CalendarConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,6 +26,14 @@ pub struct GitlabConfig {
     pub token: String,
     #[serde(default)]
     pub username: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalendarConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ics_url: String,
 }
 
 pub fn default_path() -> Result<PathBuf> {
@@ -102,9 +112,29 @@ mod tests {
                 token: "glpat-abc".into(),
                 username: "mtapps".into(),
             },
+            calendar: CalendarConfig {
+                enabled: true,
+                ics_url: "https://outlook.office365.com/owa/calendar/abc/calendar.ics".into(),
+            },
         };
         save(&p, &s).unwrap();
         assert_eq!(load(&p).unwrap(), s);
+    }
+
+    #[test]
+    fn missing_calendar_section_loads_as_default() {
+        let p = tempdir().join("config.toml");
+        let toml = r#"
+[gitlab]
+enabled = true
+instance_url = "https://gitlab.example.com"
+token = "glpat-abc"
+username = "mtapps"
+"#;
+        std::fs::write(&p, toml).unwrap();
+        let loaded = load(&p).unwrap();
+        assert_eq!(loaded.calendar, CalendarConfig::default());
+        assert!(loaded.gitlab.enabled);
     }
 
     #[test]

@@ -12,9 +12,13 @@ use crate::config::Settings;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Gitlab,
+    Calendar,
 }
 
-const TOP_ITEMS: &[(Section, &str)] = &[(Section::Gitlab, "GitLab integration")];
+const TOP_ITEMS: &[(Section, &str)] = &[
+    (Section::Gitlab, "GitLab integration"),
+    (Section::Calendar, "Calendar integration"),
+];
 
 #[derive(Debug, Clone, Copy)]
 enum FieldKind {
@@ -346,6 +350,7 @@ impl SettingsState {
 fn section_title(section: Section) -> &'static str {
     match section {
         Section::Gitlab => "GitLab",
+        Section::Calendar => "Calendar",
     }
 }
 
@@ -356,6 +361,10 @@ fn section_fields(section: Section) -> &'static [(&'static str, FieldKind)] {
             ("Instance URL", FieldKind::Text),
             ("Personal Token", FieldKind::Secret),
             ("Username", FieldKind::Text),
+        ],
+        Section::Calendar => &[
+            ("Enabled", FieldKind::Toggle),
+            ("ICS URL", FieldKind::Text),
         ],
     }
 }
@@ -372,13 +381,19 @@ fn field_value(settings: &Settings, section: Section, idx: usize) -> String {
         (Section::Gitlab, 1) => settings.gitlab.instance_url.clone(),
         (Section::Gitlab, 2) => settings.gitlab.token.clone(),
         (Section::Gitlab, 3) => settings.gitlab.username.clone(),
+        (Section::Calendar, 0) => {
+            if settings.calendar.enabled { "[x]".into() } else { "[ ]".into() }
+        }
+        (Section::Calendar, 1) => settings.calendar.ics_url.clone(),
         _ => String::new(),
     }
 }
 
 fn toggle_field(settings: &mut Settings, section: Section, idx: usize) {
-    if let (Section::Gitlab, 0) = (section, idx) {
-        settings.gitlab.enabled = !settings.gitlab.enabled;
+    match (section, idx) {
+        (Section::Gitlab, 0) => settings.gitlab.enabled = !settings.gitlab.enabled,
+        (Section::Calendar, 0) => settings.calendar.enabled = !settings.calendar.enabled,
+        _ => {}
     }
 }
 
@@ -387,6 +402,7 @@ fn text_field_mut(settings: &mut Settings, section: Section, idx: usize) -> Opti
         (Section::Gitlab, 1) => Some(&mut settings.gitlab.instance_url),
         (Section::Gitlab, 2) => Some(&mut settings.gitlab.token),
         (Section::Gitlab, 3) => Some(&mut settings.gitlab.username),
+        (Section::Calendar, 1) => Some(&mut settings.calendar.ics_url),
         _ => None,
     }
 }
