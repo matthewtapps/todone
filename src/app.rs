@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use chrono::{Local, NaiveDate};
@@ -14,6 +17,7 @@ use ratatui::{
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
+    clipboard, format,
     storage::{self, Store, previous_workday},
     vim::{Mode, VimBuffer},
 };
@@ -22,6 +26,11 @@ use crate::{
 enum Pane {
     Did,
     Planning,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Yank,
 }
 
 pub struct App<'a> {
@@ -38,7 +47,13 @@ pub struct App<'a> {
     ex_command: Option<String>,
     /// One-line transient message shown in the status bar (e.g. "written").
     status_msg: Option<String>,
+    /// When `status_msg` should be cleared automatically.
+    status_msg_until: Option<Instant>,
+    /// `Some` when a verb has been pressed and we're waiting for its target key.
+    pending_verb: Option<Verb>,
 }
+
+const STATUS_MSG_DURATION: Duration = Duration::from_secs(2);
 
 impl<'a> App<'a> {
     pub fn new(path: PathBuf) -> Result<Self> {
@@ -77,6 +92,8 @@ impl<'a> App<'a> {
             quit: false,
             ex_command: None,
             status_msg: None,
+            status_msg_until: None,
+            pending_verb: None,
         };
         app.refresh_styles();
         Ok(app)
@@ -84,16 +101,40 @@ impl<'a> App<'a> {
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         while !self.quit {
+            // Expire any status message whose timeout has elapsed.
+            if let Some(deadline) = self.status_msg_until {
+                if Instant::now() >= deadline {
+                    self.clear_status();
+                }
+            }
             terminal.draw(|f| self.draw(f))?;
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    self.handle_key(k);
+
+            // Block on input, but wake up to clear the status message.
+            let timeout = self
+                .status_msg_until
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_secs(3600));
+            if event::poll(timeout)? {
+                if let Event::Key(k) = event::read()? {
+                    if k.kind == KeyEventKind::Press {
+                        self.handle_key(k);
+                    }
                 }
             }
             self.refresh_styles();
         }
         self.persist()?;
         Ok(())
+    }
+
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_msg = Some(msg.into());
+        self.status_msg_until = Some(Instant::now() + STATUS_MSG_DURATION);
+    }
+
+    fn clear_status(&mut self) {
+        self.status_msg = None;
+        self.status_msg_until = None;
     }
 
     fn handle_key(&mut self, k: KeyEvent) {
@@ -103,8 +144,11 @@ impl<'a> App<'a> {
             self.handle_ex_key(k);
             return;
         }
-        // Any new keystroke clears the previous transient status message.
-        self.status_msg = None;
+        // A pending verb consumes the next keystroke as its target (or cancels).
+        if let Some(verb) = self.pending_verb.take() {
+            self.handle_verb_target(verb, k);
+            return;
+        }
         // Global: Ctrl-Q quits. Always wins, even in insert mode.
         if k.code == KeyCode::Char('q') && k.modifiers.contains(M::CONTROL) {
             self.quit = true;
@@ -138,7 +182,85 @@ impl<'a> App<'a> {
             self.ex_command = Some(String::new());
             return;
         }
-        // y and <space> wired up in the yank-verb step.
+        if k.code == KeyCode::Char('y') && k.modifiers.is_empty() {
+            self.pending_verb = Some(Verb::Yank);
+            return;
+        }
+        // <space> leader is wired up when we add the help overlay.
+    }
+
+    fn handle_verb_target(&mut self, verb: Verb, k: KeyEvent) {
+        // Esc or any non-target key cancels silently.
+        match (verb, k.code) {
+            (Verb::Yank, KeyCode::Char('t')) => self.yank_teams(),
+            (Verb::Yank, KeyCode::Char('x')) => self.yank_xero(),
+            (Verb::Yank, KeyCode::Char('d')) => self.yank_did(),
+            (Verb::Yank, KeyCode::Char('p')) => self.yank_planning(),
+            _ => {}
+        }
+    }
+
+    fn yank_teams(&mut self) {
+        let store = self.current_store_view();
+        let text = format::standup(&store, self.today);
+        self.copy_to_clipboard(text, "yanked teams");
+    }
+
+    fn yank_xero(&mut self) {
+        let store = self.current_store_view();
+        let text = format::timesheet(&store, self.yesterday);
+        self.copy_to_clipboard(text, format!("yanked xero ({})", self.yesterday));
+    }
+
+    fn yank_did(&mut self) {
+        let store = self.current_store_view();
+        let did = store.get(self.yesterday).map(|e| &e.did[..]).unwrap_or(&[]);
+        let text = format::bullets(did);
+        self.copy_to_clipboard(text, "yanked yesterday's did");
+    }
+
+    fn yank_planning(&mut self) {
+        let store = self.current_store_view();
+        let planning = store
+            .get(self.today)
+            .map(|e| &e.planning[..])
+            .unwrap_or(&[]);
+        let text = format::bullets(planning);
+        self.copy_to_clipboard(text, "yanked today's planning");
+    }
+
+    fn copy_to_clipboard(&mut self, text: String, ok_msg: impl Into<String>) {
+        match clipboard::copy(&text) {
+            Ok(()) => self.set_status(ok_msg),
+            Err(e) => self.set_status(format!("E: clipboard: {e}")),
+        }
+    }
+
+    /// A snapshot of the store with the current buffer contents applied.
+    /// Used by the yank verb so we copy what's on-screen, not what's on disk.
+    fn current_store_view(&self) -> Store {
+        let mut s = self.store.clone();
+        self.apply_buffer_state(&mut s);
+        s
+    }
+
+    fn apply_buffer_state(&self, store: &mut Store) {
+        let did = collect_bullets(&self.did_buf.area);
+        let planning = collect_bullets(&self.planning_buf.area);
+        if did.is_empty() {
+            if let Some(e) = store.entries.get_mut(&self.yesterday) {
+                e.did.clear();
+            }
+        } else {
+            store.entry_mut(self.yesterday).did = did;
+        }
+        if planning.is_empty() {
+            if let Some(e) = store.entries.get_mut(&self.today) {
+                e.planning.clear();
+            }
+        } else {
+            store.entry_mut(self.today).planning = planning;
+        }
     }
 
     fn handle_ex_key(&mut self, k: KeyEvent) {
@@ -171,16 +293,16 @@ impl<'a> App<'a> {
     fn execute_ex(&mut self, cmd: &str) {
         match cmd.trim() {
             "w" => match self.persist() {
-                Ok(()) => self.status_msg = Some("written".to_string()),
-                Err(e) => self.status_msg = Some(format!("E: save failed: {e}")),
+                Ok(()) => self.set_status("written"),
+                Err(e) => self.set_status(format!("E: save failed: {e}")),
             },
             "wq" | "x" => match self.persist() {
                 Ok(()) => self.quit = true,
-                Err(e) => self.status_msg = Some(format!("E: save failed: {e}")),
+                Err(e) => self.set_status(format!("E: save failed: {e}")),
             },
             "q" => self.quit = true,
             "" => {}
-            other => self.status_msg = Some(format!("E: unknown command \"{other}\"")),
+            other => self.set_status(format!("E: unknown command \"{other}\"")),
         }
     }
 
@@ -278,13 +400,30 @@ impl<'a> App<'a> {
             f.render_widget(Paragraph::new(line), area);
             return;
         }
+        if let Some(Verb::Yank) = self.pending_verb {
+            let line = Line::from(vec![
+                Span::styled(
+                    " YANK ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " t: teams    x: xero    d: did    p: planning    (any other key cancels) ",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
         let mode = self.focused_mode();
         let (mode_fg, mode_bg) = match mode {
             Mode::Normal => (Color::Black, Color::Green),
             Mode::Insert => (Color::Black, Color::Yellow),
         };
         let hint = match mode {
-            Mode::Normal => " i/a/o: insert    hjkl/w/b/e/0/$: move    gg/G: top/bot    dd/cc/D/C/x: delete    u/Ctrl-R: undo    Tab: switch    :w/:wq/:q    q: quit ",
+            Mode::Normal => " i/a/o insert  hjkl/w/b/e/0/$ move  gg/G ends  dd/cc/D/C/x del  u/Ctrl-R undo  y{t,x,d,p} yank  :w/:wq/:q  Tab switch  q quit ",
             Mode::Insert => " Esc/jj: normal    Ctrl-Backspace: delete word    Tab: switch ",
         };
         let line = Line::from(vec![
@@ -301,26 +440,11 @@ impl<'a> App<'a> {
     }
 
     fn persist(&mut self) -> Result<()> {
-        let did = collect_bullets(&self.did_buf.area);
-        let planning = collect_bullets(&self.planning_buf.area);
-
-        if did.is_empty() {
-            if let Some(e) = self.store.entries.get_mut(&self.yesterday) {
-                e.did.clear();
-            }
-        } else {
-            self.store.entry_mut(self.yesterday).did = did;
-        }
-
-        if planning.is_empty() {
-            if let Some(e) = self.store.entries.get_mut(&self.today) {
-                e.planning.clear();
-            }
-        } else {
-            self.store.entry_mut(self.today).planning = planning;
-        }
-
-        storage::save(&self.path, &self.store)
+        let mut store = self.store.clone();
+        self.apply_buffer_state(&mut store);
+        storage::save(&self.path, &store)?;
+        self.store = store;
+        Ok(())
     }
 }
 
