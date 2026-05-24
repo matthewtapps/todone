@@ -24,7 +24,21 @@ Or add it as a flake input.
 
 ### Non-Nix
 
-Requires a Rust toolchain (stable, edition 2024). Linux (X11 and Wayland) and macOS are supported; Windows is not.
+Linux (X11 and Wayland) and macOS are supported; Windows is not.
+
+Prebuilt binary (installs to `~/.cargo/bin` by default):
+
+```
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/matthewtapps/todone/releases/latest/download/todone-installer.sh | sh
+```
+
+Via `cargo binstall` (no compilation):
+
+```
+cargo binstall todone
+```
+
+Or build from source. Needs a Rust toolchain (stable, edition 2024):
 
 ```
 git clone git@github.com:matthewtapps/todone.git

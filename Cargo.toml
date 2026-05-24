@@ -2,6 +2,7 @@
 name = "todone"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/matthewtapps/todone"
 
 [dependencies]
 ratatui = "0.29"
@@ -25,3 +26,8 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
