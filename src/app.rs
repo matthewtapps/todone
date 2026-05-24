@@ -1,5 +1,8 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -14,10 +17,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use tokio::runtime::Handle;
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     clipboard, config, format,
+    gitlab::{self, RawEvent},
     history::{HistoryAction, HistoryState},
     settings::{SettingsAction, SettingsState},
     storage::{self, Store, previous_workday},
@@ -42,6 +47,28 @@ enum Screen {
     History,
     Settings,
 }
+
+/// Events flowing into the main loop from input and background tasks.
+pub enum AppEvent {
+    Input(KeyEvent),
+    /// User lookup completed.
+    GitlabUserResolved(std::result::Result<u64, String>),
+    /// One date's events fetched (or failed).
+    GitlabFetched {
+        date: NaiveDate,
+        result: std::result::Result<Vec<RawEvent>, String>,
+    },
+}
+
+struct GitlabCacheEntry {
+    events: Vec<RawEvent>,
+    fetched_at: Instant,
+}
+
+/// How long a fetched events list is considered fresh.
+const GITLAB_TTL: Duration = Duration::from_secs(30 * 60);
+/// Workdays before today to optimistically prefetch on startup.
+const GITLAB_PREFETCH_DAYS: usize = 7;
 
 pub struct App<'a> {
     path: PathBuf,
@@ -70,12 +97,20 @@ pub struct App<'a> {
     help_open: bool,
     config_path: PathBuf,
     settings_state: SettingsState,
+    runtime: Handle,
+    event_tx: mpsc::Sender<AppEvent>,
+    event_rx: mpsc::Receiver<AppEvent>,
+    gitlab_client: Option<gitlab::Client>,
+    gitlab_user_id: Option<u64>,
+    gitlab_cache: BTreeMap<NaiveDate, GitlabCacheEntry>,
+    gitlab_in_flight: std::collections::HashSet<NaiveDate>,
+    gitlab_resolve_in_flight: bool,
 }
 
 const STATUS_MSG_DURATION: Duration = Duration::from_secs(2);
 
 impl<'a> App<'a> {
-    pub fn new(path: PathBuf) -> Result<Self> {
+    pub fn new(path: PathBuf, runtime: Handle) -> Result<Self> {
         let store = storage::load(&path)?;
         let today = Local::now().date_naive();
         let viewing_date = today;
@@ -89,6 +124,8 @@ impl<'a> App<'a> {
 
         let config_path = config::default_path()?;
         let settings = config::load(&config_path)?;
+
+        let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
 
         let mut app = Self {
             path,
@@ -110,8 +147,17 @@ impl<'a> App<'a> {
             help_open: false,
             config_path,
             settings_state: SettingsState::new(settings),
+            runtime,
+            event_tx,
+            event_rx,
+            gitlab_client: None,
+            gitlab_user_id: None,
+            gitlab_cache: BTreeMap::new(),
+            gitlab_in_flight: Default::default(),
+            gitlab_resolve_in_flight: false,
         };
         app.refresh_styles();
+        app.init_gitlab();
         Ok(app)
     }
 
@@ -133,6 +179,8 @@ impl<'a> App<'a> {
         // Reset focus to the did pane so the user lands on the editable
         // "what I did" target for the new day.
         self.focus = Pane::Did;
+        // Warm the GitLab context for the new viewing date's yesterday.
+        self.fetch_for_date(self.yesterday, false);
     }
 
     fn save_buffers_to_store(&mut self) {
@@ -142,6 +190,8 @@ impl<'a> App<'a> {
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+        spawn_input_thread(self.event_tx.clone());
+
         while !self.quit {
             // Expire any status message whose timeout has elapsed.
             if let Some(deadline) = self.status_msg_until {
@@ -151,22 +201,145 @@ impl<'a> App<'a> {
             }
             terminal.draw(|f| self.draw(f))?;
 
-            // Block on input, but wake up to clear the status message.
+            // Block on the next app event, waking only to clear status.
             let timeout = self
                 .status_msg_until
                 .map(|d| d.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::from_secs(3600));
-            if event::poll(timeout)? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
-                        self.handle_key(k);
-                    }
-                }
+            match self.event_rx.recv_timeout(timeout) {
+                Ok(ev) => self.handle_event(ev),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
             self.refresh_styles();
         }
         self.persist()?;
         Ok(())
+    }
+
+    fn handle_event(&mut self, ev: AppEvent) {
+        match ev {
+            AppEvent::Input(k) => self.handle_key(k),
+            AppEvent::GitlabUserResolved(result) => {
+                self.gitlab_resolve_in_flight = false;
+                match result {
+                    Ok(uid) => {
+                        self.gitlab_user_id = Some(uid);
+                        self.kick_off_prefetch();
+                    }
+                    Err(e) => self.set_status(format!("E: gitlab user: {e}")),
+                }
+            }
+            AppEvent::GitlabFetched { date, result } => {
+                self.gitlab_in_flight.remove(&date);
+                match result {
+                    Ok(events) => {
+                        let n = events.len();
+                        if let Err(e) = dump_events(date, &events) {
+                            self.set_status(format!(
+                                "gitlab: {n} events for {date} (cache write E: {e})"
+                            ));
+                        } else {
+                            self.set_status(format!("gitlab: {n} events for {date}"));
+                        }
+                        self.gitlab_cache.insert(
+                            date,
+                            GitlabCacheEntry { events, fetched_at: Instant::now() },
+                        );
+                    }
+                    Err(e) => self.set_status(format!("E: gitlab fetch {date}: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Build a GitLab client from current settings (or clear it) and kick off
+    /// user resolution. Called at startup and after settings save.
+    fn init_gitlab(&mut self) {
+        let cfg = &self.settings_state.settings.gitlab;
+        if !cfg.enabled
+            || cfg.instance_url.trim().is_empty()
+            || cfg.token.trim().is_empty()
+            || cfg.username.trim().is_empty()
+        {
+            self.gitlab_client = None;
+            self.gitlab_user_id = None;
+            return;
+        }
+        let client = match gitlab::Client::new(&cfg.instance_url, &cfg.token) {
+            Ok(c) => c,
+            Err(e) => {
+                self.set_status(format!("E: gitlab client: {e}"));
+                return;
+            }
+        };
+        self.gitlab_client = Some(client.clone());
+        self.gitlab_user_id = None;
+        self.gitlab_resolve_in_flight = true;
+        let username = cfg.username.clone();
+        let tx = self.event_tx.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .resolve_user(&username)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::GitlabUserResolved(result));
+        });
+    }
+
+    /// Optimistically fetch events for yesterday + the previous workdays so
+    /// the user has context warm by the time they navigate.
+    fn kick_off_prefetch(&mut self) {
+        let mut d = previous_workday(self.viewing_date);
+        for _ in 0..GITLAB_PREFETCH_DAYS {
+            self.fetch_for_date(d, false);
+            d = previous_workday(d);
+        }
+    }
+
+    /// Fetch events for `date`. Skips if a fetch is already in flight or the
+    /// cached entry is still fresh (unless `force`).
+    fn fetch_for_date(&mut self, date: NaiveDate, force: bool) {
+        let Some(client) = self.gitlab_client.clone() else { return };
+        let Some(uid) = self.gitlab_user_id else { return };
+        if self.gitlab_in_flight.contains(&date) {
+            return;
+        }
+        if !force {
+            if let Some(entry) = self.gitlab_cache.get(&date) {
+                if entry.fetched_at.elapsed() < GITLAB_TTL {
+                    return;
+                }
+            }
+        }
+        self.gitlab_in_flight.insert(date);
+        let tx = self.event_tx.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .fetch_events(uid, date)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::GitlabFetched { date, result });
+        });
+    }
+
+    /// Refresh GitLab events for the date currently summarised (yesterday of
+    /// the viewing date). Triggered by `<Space>r`.
+    fn refresh_gitlab(&mut self) {
+        if self.gitlab_client.is_none() {
+            self.set_status("gitlab not configured");
+            return;
+        }
+        if self.gitlab_user_id.is_none() {
+            if !self.gitlab_resolve_in_flight {
+                self.init_gitlab();
+            }
+            self.set_status("gitlab: resolving user...");
+            return;
+        }
+        let target = previous_workday(self.viewing_date);
+        self.fetch_for_date(target, true);
+        self.set_status(format!("gitlab: refreshing {target}"));
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -235,6 +408,8 @@ impl<'a> App<'a> {
             Ok(()) => {
                 self.settings_state.mark_clean();
                 self.set_status("settings saved");
+                // Re-evaluate gitlab integration in case its config changed.
+                self.init_gitlab();
             }
             Err(e) => self.set_status(format!("E: settings save failed: {e}")),
         }
@@ -332,6 +507,7 @@ impl<'a> App<'a> {
             (Pending::Yank, KeyCode::Char('p')) => self.yank_planning(),
             (Pending::Leader, KeyCode::Char('h')) => self.open_history(),
             (Pending::Leader, KeyCode::Char('s')) => self.open_settings(),
+            (Pending::Leader, KeyCode::Char('r')) => self.refresh_gitlab(),
             (Pending::Leader, KeyCode::Char('?')) => self.help_open = true,
             _ => {}
         }
@@ -659,7 +835,7 @@ impl<'a> App<'a> {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        " h: history    s: settings    (any other key cancels) ",
+                        " h: history    s: settings    r: refresh gitlab    (any other key cancels) ",
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]);
@@ -807,6 +983,36 @@ fn apply_focus(buf: &mut TextArea<'_>, title: String, focused: bool, mode: Mode)
     } else {
         buf.set_cursor_style(Style::default());
     }
+}
+
+/// Spawn a daemon thread that forwards crossterm key presses onto `tx`. The
+/// thread exits when the channel is dropped (i.e. on app shutdown).
+fn spawn_input_thread(tx: mpsc::Sender<AppEvent>) {
+    thread::spawn(move || loop {
+        let Ok(ev) = event::read() else { return };
+        if let Event::Key(k) = ev {
+            if k.kind == KeyEventKind::Press {
+                if tx.send(AppEvent::Input(k)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Persist raw events for `date` to ~/.cache/standup/gitlab/{date}.json so
+/// the user can inspect the API output during phase 2. Phase 3+ will surface
+/// this in-app via the context pane.
+fn dump_events(date: NaiveDate, events: &[RawEvent]) -> Result<()> {
+    let dir = dirs::cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("no cache dir"))?
+        .join("standup")
+        .join("gitlab");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{date}.json"));
+    let json = serde_json::to_string_pretty(events)?;
+    std::fs::write(&path, json)?;
+    Ok(())
 }
 
 /// Word-wrap `text` to `width`, prepending `indent_spaces` spaces on every line

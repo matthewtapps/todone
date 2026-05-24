@@ -75,6 +75,7 @@ fn content() -> Vec<Line<'static>> {
         h("Leader (Space then key)"),
         row("<Space>h", "open history"),
         row("<Space>s", "open settings"),
+        row("<Space>r", "refresh gitlab events for current 'yesterday'"),
         row("<Space>?", "open this help"),
         Line::from(""),
         h("Settings screen"),
