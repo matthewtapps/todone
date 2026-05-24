@@ -270,7 +270,7 @@ impl Client {
         );
         let client = reqwest::Client::builder()
             .default_headers(headers)
-            .user_agent("standup")
+            .user_agent("todone")
             .build()
             .context("building HTTP client")?;
         Ok(Self {

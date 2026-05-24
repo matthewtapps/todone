@@ -392,7 +392,7 @@ impl Client {
             return Err(anyhow!("ICS URL is empty"));
         }
         let http = reqwest::Client::builder()
-            .user_agent("standup")
+            .user_agent("todone")
             .build()
             .context("building HTTP client")?;
         Ok(Self { url, http })

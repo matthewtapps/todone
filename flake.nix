@@ -1,5 +1,5 @@
 {
-  description = "standup — daily dot-points TUI";
+  description = "todone — persistent work tracking TUI";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
@@ -11,18 +11,18 @@
     in
     {
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
-        pname = "standup";
+        pname = "todone";
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
         nativeBuildInputs = [ pkgs.makeWrapper ];
         postInstall = ''
-          wrapProgram $out/bin/standup \
+          wrapProgram $out/bin/todone \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.wl-clipboard ]}
         '';
         meta = {
-          description = "Daily dot-points TUI for standups";
-          mainProgram = "standup";
+          description = "Persistent work tracking TUI";
+          mainProgram = "todone";
         };
       };
 

@@ -64,7 +64,7 @@ impl Store {
 pub fn default_path() -> Result<PathBuf> {
     let dir = dirs::data_dir()
         .context("could not determine XDG data dir")?
-        .join("standup");
+        .join("todone");
     Ok(dir.join("entries.json"))
 }
 
@@ -219,7 +219,7 @@ mod tests {
 
     fn tempdir() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "standup-test-{}-{}",
+            "todone-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

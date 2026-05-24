@@ -1005,7 +1005,7 @@ impl<'a> App<'a> {
             Color::Yellow
         };
         let line = Line::from(vec![
-            Span::styled(" standup — ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(" todone — ", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format_date_short(self.viewing_date),
                 Style::default()

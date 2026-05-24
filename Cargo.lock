@@ -1378,27 +1378,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "standup"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "crossterm",
- "dirs",
- "icalendar",
- "ratatui",
- "reqwest",
- "rrule",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tui-textarea",
- "windows-timezones",
-]
-
-[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,6 +1492,27 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "todone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "crossterm",
+ "dirs",
+ "icalendar",
+ "ratatui",
+ "reqwest",
+ "rrule",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tui-textarea",
+ "windows-timezones",
+]
 
 [[package]]
 name = "tokio"

@@ -39,7 +39,7 @@ pub struct CalendarConfig {
 pub fn default_path() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .context("could not determine XDG config dir")?
-        .join("standup");
+        .join("todone");
     Ok(dir.join("config.toml"))
 }
 
@@ -85,7 +85,7 @@ mod tests {
 
     fn tempdir() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "standup-config-test-{}-{}",
+            "todone-config-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
