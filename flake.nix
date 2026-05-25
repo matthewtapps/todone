@@ -15,6 +15,9 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
+        preCheck = ''
+          export TZ=":${pkgs.tzdata}/share/zoneinfo/Australia/Melbourne"
+        '';
         meta = {
           description = "Persistent work tracking TUI";
           mainProgram = "todone";
