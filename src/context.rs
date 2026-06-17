@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use chrono::NaiveDate;
 use ratatui::{
     Frame,
@@ -19,13 +21,30 @@ pub enum Tab {
 
 const TAB_ORDER: [Tab; 3] = [Tab::Planning, Tab::Gitlab, Tab::Calendar];
 
+fn tab_index(t: Tab) -> usize {
+    match t {
+        Tab::Planning => 0,
+        Tab::Gitlab => 1,
+        Tab::Calendar => 2,
+    }
+}
+
 pub struct ContextState {
     pub tab: Tab,
+    /// Per-tab scroll offset (first visible row).
+    scrolls: Cell<[u16; 3]>,
+    /// Per-tab max scroll offset, cached from the last render. Used to clamp
+    /// scroll commands; interior-mutable so draw can update it via `&self`.
+    max_scrolls: Cell<[u16; 3]>,
 }
 
 impl ContextState {
     pub fn new(initial: Tab) -> Self {
-        Self { tab: initial }
+        Self {
+            tab: initial,
+            scrolls: Cell::new([0; 3]),
+            max_scrolls: Cell::new([0; 3]),
+        }
     }
 
     pub fn cycle(&mut self, delta: i32) {
@@ -36,6 +55,49 @@ impl ContextState {
         let n = TAB_ORDER.len() as i32;
         let next = (cur + delta).rem_euclid(n) as usize;
         self.tab = TAB_ORDER[next];
+    }
+
+    fn current_scroll(&self) -> u16 {
+        self.scrolls.get()[tab_index(self.tab)]
+    }
+
+    /// Scroll the active tab by `delta` rows, clamped to `[0, max_scroll]`.
+    pub fn scroll_by(&self, delta: i32) {
+        let idx = tab_index(self.tab);
+        let max = self.max_scrolls.get()[idx] as i32;
+        let mut scrolls = self.scrolls.get();
+        let new = (scrolls[idx] as i32 + delta).clamp(0, max) as u16;
+        scrolls[idx] = new;
+        self.scrolls.set(scrolls);
+    }
+
+    pub fn scroll_to_top(&self) {
+        let idx = tab_index(self.tab);
+        let mut scrolls = self.scrolls.get();
+        scrolls[idx] = 0;
+        self.scrolls.set(scrolls);
+    }
+
+    pub fn scroll_to_bottom(&self) {
+        let idx = tab_index(self.tab);
+        let max = self.max_scrolls.get()[idx];
+        let mut scrolls = self.scrolls.get();
+        scrolls[idx] = max;
+        self.scrolls.set(scrolls);
+    }
+
+    /// Record the maximum scroll for `tab` after a render, and clamp the
+    /// stored offset down to it.
+    fn update_max_scroll(&self, tab: Tab, max: u16) {
+        let idx = tab_index(tab);
+        let mut maxes = self.max_scrolls.get();
+        maxes[idx] = max;
+        self.max_scrolls.set(maxes);
+        let mut scrolls = self.scrolls.get();
+        if scrolls[idx] > max {
+            scrolls[idx] = max;
+            self.scrolls.set(scrolls);
+        }
     }
 }
 
@@ -100,9 +162,9 @@ pub fn draw(
         return;
     }
     match state.tab {
-        Tab::Planning => draw_planning(f, chunks[1], planning),
-        Tab::Gitlab => draw_gitlab(f, chunks[1], &gitlab),
-        Tab::Calendar => draw_calendar(f, chunks[1], &calendar, yesterday, viewing_date),
+        Tab::Planning => draw_planning(f, chunks[1], planning, state),
+        Tab::Gitlab => draw_gitlab(f, chunks[1], &gitlab, state),
+        Tab::Calendar => draw_calendar(f, chunks[1], &calendar, yesterday, viewing_date, state),
     }
 }
 
@@ -152,7 +214,7 @@ fn draw_tabs(
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_planning(f: &mut Frame, area: Rect, planning: &[String]) {
+fn draw_planning(f: &mut Frame, area: Rect, planning: &[String], state: &ContextState) {
     let width = area.width as usize;
     let body: Vec<Line> = if planning.is_empty() {
         vec![Line::from(Span::styled(
@@ -169,10 +231,13 @@ fn draw_planning(f: &mut Frame, area: Rect, planning: &[String]) {
             })
             .collect()
     };
-    f.render_widget(Paragraph::new(body), area);
+    let max = (body.len() as u16).saturating_sub(area.height);
+    state.update_max_scroll(Tab::Planning, max);
+    let scroll = state.current_scroll();
+    f.render_widget(Paragraph::new(body).scroll((scroll, 0)), area);
 }
 
-fn draw_gitlab(f: &mut Frame, area: Rect, status: &GitlabPaneStatus) {
+fn draw_gitlab(f: &mut Frame, area: Rect, status: &GitlabPaneStatus, state: &ContextState) {
     let width = area.width as usize;
     let body = match status {
         GitlabPaneStatus::Disabled => vec![Line::from(Span::styled(
@@ -214,7 +279,10 @@ fn draw_gitlab(f: &mut Frame, area: Rect, status: &GitlabPaneStatus) {
             }
         }
     };
-    f.render_widget(Paragraph::new(body), area);
+    let max = (body.len() as u16).saturating_sub(area.height);
+    state.update_max_scroll(Tab::Gitlab, max);
+    let scroll = state.current_scroll();
+    f.render_widget(Paragraph::new(body).scroll((scroll, 0)), area);
 }
 
 fn draw_calendar(
@@ -223,10 +291,12 @@ fn draw_calendar(
     status: &CalendarPaneStatus,
     yesterday: NaiveDate,
     today: NaiveDate,
+    state: &ContextState,
 ) {
     let width = area.width as usize;
     match status {
         CalendarPaneStatus::Disabled => {
+            state.update_max_scroll(Tab::Calendar, 0);
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     " Calendar integration disabled — enable in <Space>s settings",
@@ -236,6 +306,7 @@ fn draw_calendar(
             );
         }
         CalendarPaneStatus::Loading => {
+            state.update_max_scroll(Tab::Calendar, 0);
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     " fetching…",
@@ -245,6 +316,7 @@ fn draw_calendar(
             );
         }
         CalendarPaneStatus::Error(msg) => {
+            state.update_max_scroll(Tab::Calendar, 0);
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" error: {msg}"),
@@ -259,8 +331,13 @@ fn draw_calendar(
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
             let col_width = (width / 2).max(1);
-            draw_calendar_column(f, cols[0], yesterday, y_events, col_width);
-            draw_calendar_column(f, cols[1], today, t_events, col_width);
+            let scroll = state.current_scroll();
+            let y_len = draw_calendar_column(f, cols[0], yesterday, y_events, col_width, scroll);
+            let t_len = draw_calendar_column(f, cols[1], today, t_events, col_width, scroll);
+            // Both columns scroll together; clamp to whichever column is longer
+            // so the user can always reach the bottom of either.
+            let max = y_len.max(t_len).saturating_sub(area.height);
+            state.update_max_scroll(Tab::Calendar, max);
         }
     }
 }
@@ -271,7 +348,8 @@ fn draw_calendar_column(
     date: NaiveDate,
     events: &[CalendarEvent],
     width: usize,
-) {
+    scroll: u16,
+) -> u16 {
     let mut body = Vec::new();
     body.push(Line::from(Span::styled(
         format!(" {}", format_date(date)),
@@ -289,7 +367,9 @@ fn draw_calendar_column(
             body.extend(calendar_event_lines(ev, width));
         }
     }
-    f.render_widget(Paragraph::new(body), area);
+    let total = body.len() as u16;
+    f.render_widget(Paragraph::new(body).scroll((scroll, 0)), area);
+    total
 }
 
 /// Format one event as: " HH:MM-HH:MM  Summary" (or "  all day    Summary").

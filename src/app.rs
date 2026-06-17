@@ -43,6 +43,8 @@ enum Pane {
 enum Pending {
     Yank,
     Leader,
+    /// First `g` of a `gg` (scroll-to-top) sequence in the context pane.
+    ContextG,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -151,12 +153,12 @@ impl<'a> App<'a> {
         let config_path = config::default_path()?;
         let settings = config::load(&config_path)?;
 
-        // Prefer Calendar > GitLab > Planning when configured — both
+        // Prefer GitLab > Calendar > Planning when configured — both
         // integrations carry more context than yesterday's planning bullets.
-        let initial_tab = if settings.calendar.enabled {
-            ContextTab::Calendar
-        } else if settings.gitlab.enabled {
+        let initial_tab = if settings.gitlab.enabled {
             ContextTab::Gitlab
+        } else if settings.calendar.enabled {
+            ContextTab::Calendar
         } else {
             ContextTab::Planning
         };
@@ -610,6 +612,9 @@ impl<'a> App<'a> {
         }
         // From the context pane there's no editor — every key is app-level.
         if self.focus == Pane::Context {
+            if self.handle_context_scroll(k) {
+                return;
+            }
             self.handle_app_verb(k);
             return;
         }
@@ -710,8 +715,58 @@ impl<'a> App<'a> {
             (Pending::Leader, KeyCode::Char('s')) => self.open_settings(),
             (Pending::Leader, KeyCode::Char('r')) => self.refresh_integrations(),
             (Pending::Leader, KeyCode::Char('?')) => self.help_open = true,
+            (Pending::ContextG, KeyCode::Char('g')) => self.context_state.scroll_to_top(),
             _ => {}
         }
+    }
+
+    /// Vim-style scrolling for the context pane. Returns true if `k` was a
+    /// scroll command and has been handled.
+    fn handle_context_scroll(&mut self, k: KeyEvent) -> bool {
+        use crossterm::event::KeyModifiers as M;
+        if k.modifiers.is_empty() {
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.context_state.scroll_by(1);
+                    return true;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.context_state.scroll_by(-1);
+                    return true;
+                }
+                KeyCode::Char('g') => {
+                    self.pending = Some(Pending::ContextG);
+                    return true;
+                }
+                KeyCode::PageDown => {
+                    self.context_state.scroll_by(10);
+                    return true;
+                }
+                KeyCode::PageUp => {
+                    self.context_state.scroll_by(-10);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if k.modifiers == M::SHIFT && k.code == KeyCode::Char('G') {
+            self.context_state.scroll_to_bottom();
+            return true;
+        }
+        if k.modifiers == M::CONTROL {
+            match k.code {
+                KeyCode::Char('d') => {
+                    self.context_state.scroll_by(10);
+                    return true;
+                }
+                KeyCode::Char('u') => {
+                    self.context_state.scroll_by(-10);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     fn open_history(&mut self) {
@@ -1104,7 +1159,8 @@ impl<'a> App<'a> {
                 f.render_widget(Paragraph::new(line), area);
                 return;
             }
-            None => {}
+            // gg-scroll is a 2-key sequence; no need for a banner.
+            Some(Pending::ContextG) | None => {}
         }
         if self.screen == Screen::Settings {
             let mode = self.settings_state.mode_label();
@@ -1166,7 +1222,7 @@ impl<'a> App<'a> {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " [ ] switch tab    Ctrl-K back to editor    </> day    q quit ",
+                    " [ ] tab    j/k scroll    Ctrl-d/u page    gg/G top/bot    Ctrl-K back    </> day    q quit ",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);
@@ -1213,10 +1269,9 @@ fn load_view(
         .get(yesterday)
         .map(|e| e.planning.clone())
         .unwrap_or_default();
-    // Yesterday's `did`: existing did, else its planning as a draft prompt.
     let did_lines = store
         .get(yesterday)
-        .map(|e| if e.did.is_empty() { e.planning.clone() } else { e.did.clone() })
+        .map(|e| e.did.clone())
         .unwrap_or_default();
     let planning_lines = store
         .get(viewing_date)
