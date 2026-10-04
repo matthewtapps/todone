@@ -3,6 +3,7 @@ mod calendar;
 mod clipboard;
 mod config;
 mod context;
+mod export;
 mod format;
 mod gitlab;
 mod help;
@@ -35,6 +36,11 @@ fn main() -> Result<()> {
         .worker_threads(2)
         .enable_all()
         .build()?;
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("export") {
+        return export::run(&args[1..], &runtime);
+    }
 
     let path = storage::default_path()?;
     let mut app = App::new(path, runtime.handle().clone())?;
