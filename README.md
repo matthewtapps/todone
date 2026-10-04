@@ -38,11 +38,12 @@ Via `cargo binstall` (no compilation):
 cargo binstall todone
 ```
 
-Or build from source. Needs a Rust toolchain (stable, edition 2024):
+Or build from source. Needs a Rust toolchain (stable, edition 2024) and Node.js for the timesheet web app:
 
 ```
 git clone git@github.com:matthewtapps/todone.git
 cd todone
+(cd web && npm ci && npm run build)
 cargo install --path .
 ```
 
@@ -96,3 +97,16 @@ In addition to general clipboard support for vim-mode yanks, there are leader sh
 ## History
 
 Press `<Space>h` to open the history view. Move with `j`/`k` (or `22j` to jump 22 days), `gg` for earliest recorded day, `G` for today. `Enter` loads the selected day as the new "yesterday".
+
+## Timesheet
+
+todone serves a timesheet web app on `http://127.0.0.1:8765` while it runs. Press `<Space>t` to open it. It shows a month as a grid of Xero tasks by day, with each day's todone bullets and meetings beside it, and pushes entries to Xero Projects.
+
+It uses the Xero web app's own API, so it needs a Xero session, which lasts about 12 minutes. To connect, click Connect Xero and choose one:
+
+- **Open Xero Sign-In:** sign in in the new tab, then paste the address of the blank page it lands on. If you're already signed in to Xero, it skips the login form.
+- **Paste a cURL:** copy any `go.xero.com/api/projects` request from your browser's DevTools as cURL.
+
+Entries, chosen tasks and draft keywords are stored in the browser for that address.
+
+To work on it, run `devtools dev` in `nix develop`: it runs todone from source and rebuilds the web app on save. Without Nix, run `npm ci && npm run build` in `web/` before `cargo build`.
