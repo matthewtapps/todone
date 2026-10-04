@@ -10,7 +10,7 @@
       pkgs = import nixpkgs { inherit system; };
       web = pkgs.buildNpmPackage {
         pname = "todone-web";
-        version = "0.1.0";
+        version = "1.1.0";
         src = ./web;
         npmDepsHash = "sha256-CTWvM/VTm82fJEYoUf/alPbYhBxCyHJ13u12tQHdYJw=";
         installPhase = "cp -r dist $out";
@@ -83,7 +83,7 @@
         inherit web;
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "todone";
-          version = "0.1.0";
+          version = "1.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           # The timesheet SPA is embedded into the binary at compile time.
