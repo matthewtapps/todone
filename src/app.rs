@@ -471,6 +471,25 @@ impl<'a> App<'a> {
         self.set_status(format!("refreshing {}", parts.join(" + ")));
     }
 
+    fn open_timesheet(&mut self) {
+        if let Some(e) = crate::server::START_ERROR.get() {
+            self.set_status(format!("E: {e}"));
+            return;
+        }
+        let url = crate::server::url();
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let spawned = std::process::Command::new(opener)
+            .arg(&url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => self.set_status(format!("opened {url}")),
+            Err(e) => self.set_status(format!("E: couldn't open {url}: {e}")),
+        }
+    }
+
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status_msg = Some(msg.into());
         self.status_msg_until = Some(Instant::now() + STATUS_MSG_DURATION);
@@ -714,6 +733,7 @@ impl<'a> App<'a> {
             (Pending::Leader, KeyCode::Char('h')) => self.open_history(),
             (Pending::Leader, KeyCode::Char('s')) => self.open_settings(),
             (Pending::Leader, KeyCode::Char('r')) => self.refresh_integrations(),
+            (Pending::Leader, KeyCode::Char('t')) => self.open_timesheet(),
             (Pending::Leader, KeyCode::Char('?')) => self.help_open = true,
             (Pending::ContextG, KeyCode::Char('g')) => self.context_state.scroll_to_top(),
             _ => {}
@@ -1152,7 +1172,7 @@ impl<'a> App<'a> {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        " h: history    s: settings    r: refresh integrations    (any other key cancels) ",
+                        " h: history    s: settings    r: refresh integrations    t: timesheet    (any other key cancels) ",
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]);

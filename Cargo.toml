@@ -14,8 +14,13 @@ toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+axum = "0.8"
+rust-embed = { version = "8", features = ["mime-guess"] }
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 icalendar = { version = "0.17", features = ["chrono-tz", "recurrence"] }
 chrono-tz = "0.10"
 rrule = "0.14"

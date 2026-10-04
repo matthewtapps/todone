@@ -84,6 +84,7 @@ fn content() -> Vec<Line<'static>> {
         row("<Space>h", "open history"),
         row("<Space>s", "open settings"),
         row("<Space>r", "refresh gitlab events for current 'yesterday'"),
+        row("<Space>t", "open the timesheet in your browser"),
         row("<Space>?", "open this help"),
         Line::from(""),
         h("Settings screen"),

@@ -8,9 +8,11 @@ mod format;
 mod gitlab;
 mod help;
 mod history;
+mod server;
 mod settings;
 mod storage;
 mod vim;
+mod xero_auth;
 
 use std::io::{self, Stdout};
 
@@ -41,6 +43,8 @@ fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("export") {
         return export::run(&args[1..], &runtime);
     }
+
+    runtime.spawn(server::serve());
 
     let path = storage::default_path()?;
     let mut app = App::new(path, runtime.handle().clone())?;
