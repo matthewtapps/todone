@@ -173,21 +173,23 @@ pub fn import(dir: &Path, inputs: &[Input], dry_run: bool, force: bool) -> Resul
     let mut report = vec![];
     for (month, items) in months {
         let path = timesheet::month_path(dir, &month)?;
-        let mut merge = |doc: &mut Map<String, Value>| -> Result<()> {
+        let mut merge = |doc: &mut Map<String, Value>| -> Result<bool> {
+            let mut changed = false;
             let mut rows = take_rows(doc)?;
             for (i, task, minutes) in &items {
                 let day = rows.entry(i.date.to_string()).or_default();
                 let outcome = apply(day, &task.id, *minutes, &i.desc, force);
+                changed |= matches!(outcome, Outcome::Added | Outcome::Updated | Outcome::Removed);
                 report.push(format!("{} {} / {}: {outcome:?}", i.date, task.project_name, task.name));
             }
             rows.retain(|_, day| !day.is_empty());
             doc.insert("rows".into(), serde_json::to_value(rows)?);
-            Ok(())
+            Ok(changed)
         };
         if dry_run {
             merge(&mut timesheet::read(&path)?.1)?;
         } else {
-            timesheet::modify(&path, merge)?;
+            timesheet::modify_if(&path, merge)?;
         }
     }
     Ok(report)
@@ -431,6 +433,24 @@ mod tests {
         assert_eq!(oct["rows"]["2026-10-30"][0]["minutes"], json!(60));
         let (_, nov) = timesheet::read(&timesheet::month_path(&dir, "2026-11").unwrap()).unwrap();
         assert_eq!(nov["rows"]["2026-11-02"][0]["desc"], json!("b"));
+    }
+
+    #[test]
+    fn skipped_rows_leave_the_month_version_alone() {
+        let dir = setup();
+        let path = timesheet::month_path(&dir, "2026-11").unwrap();
+        timesheet::modify(&path, |d| {
+            d.insert("rows".into(), json!({"2026-11-02": [{"id": "r", "xeroId": null, "taskId": "sa",
+                "desc": "mine", "minutes": 30, "synced": null}]}));
+            Ok(())
+        })
+        .unwrap();
+        let rows = inputs(json!([
+            {"date": "2026-11-02", "task": "Systems Administration", "minutes": 45, "desc": "new"}
+        ]));
+        let report = import(&dir, &rows, false, false).unwrap();
+        assert!(report[0].contains("Skipped"));
+        assert_eq!(timesheet::read(&path).unwrap().0, 1);
     }
 
     #[test]

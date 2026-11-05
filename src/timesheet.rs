@@ -69,6 +69,17 @@ pub fn modify(path: &Path, f: impl FnOnce(&mut Map<String, Value>) -> Result<()>
     })
 }
 
+/// Writes only when `f` returns true; otherwise the version stays put.
+pub fn modify_if(path: &Path, f: impl FnOnce(&mut Map<String, Value>) -> Result<bool>) -> Result<()> {
+    with_lock(path, || {
+        let (version, mut doc) = read(path)?;
+        if f(&mut doc)? {
+            write(path, version + 1, doc)?;
+        }
+        Ok(())
+    })
+}
+
 // The lock lives in a sidecar file because `write` renames over the document.
 fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let parent = path.parent().context("timesheet path has no parent")?;
