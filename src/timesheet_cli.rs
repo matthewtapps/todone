@@ -2,10 +2,10 @@
 
 use std::{collections::BTreeMap, fs, io, path::Path};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::timesheet;
 
@@ -446,10 +446,12 @@ mod tests {
                 .id,
             "sa"
         );
-        assert!(resolve(&tasks, &shown, &input("LW", None))
-            .unwrap_err()
-            .to_string()
-            .contains("more than one project"));
+        assert!(
+            resolve(&tasks, &shown, &input("LW", None))
+                .unwrap_err()
+                .to_string()
+                .contains("more than one project")
+        );
         assert_eq!(
             resolve(&tasks, &shown, &input("LW", Some("FY27")))
                 .unwrap()
@@ -530,8 +532,9 @@ mod tests {
     #[test]
     fn import_without_tasks_says_to_open_the_page() {
         let err = import(&tempdir(), &[], false, false).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("open the timesheet page once so todone knows your Xero tasks"));
+        assert!(
+            err.to_string()
+                .contains("open the timesheet page once so todone knows your Xero tasks")
+        );
     }
 }
