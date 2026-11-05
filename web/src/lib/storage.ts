@@ -109,7 +109,7 @@ export function useDiskDoc<T extends object>(
         (r) => {
           if (r.ok)
             setState((x) =>
-              x.path === job.path
+              x.path === job.path && x.version === job.version
                 ? { ...x, version: r.version, unsaved: x.value !== job.value }
                 : x
             )
@@ -137,7 +137,10 @@ export function useDiskDoc<T extends object>(
   )
 
   useEffect(() => {
-    if (!s.unsaved) return
+    if (!s.unsaved) {
+      pending.current = null
+      return
+    }
     pending.current = { path: s.path, version: s.version, value: s.value }
     const timer = setTimeout(() => flush(), 500)
     return () => clearTimeout(timer)
