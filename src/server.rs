@@ -18,11 +18,11 @@ use axum::{
 };
 use chrono::NaiveDate;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     calendar::RawVevent,
-    config, export, gitlab,
+    config, export, gitlab, timesheet,
     xero_auth::{self, PendingLogin, Session},
 };
 
@@ -80,6 +80,8 @@ pub async fn serve() {
             .route("/api/xero-login", post(login_start))
             .route("/api/xero-login/finish", post(login_finish))
             .route("/api/xero/{*path}", any(proxy))
+            .route("/api/timesheet/settings", get(get_settings).put(put_settings))
+            .route("/api/timesheet/{month}", get(get_month).put(put_month))
             .fallback(asset)
             .layer(middleware::from_fn(guard))
             .with_state(AppState::default());
@@ -151,6 +153,60 @@ async fn todone(State(s): State<AppState>, Query(r): Query<Range>) -> Response {
 #[derive(Deserialize)]
 struct Day {
     date: NaiveDate,
+}
+
+#[derive(Deserialize)]
+struct PutDoc {
+    version: u64,
+    #[serde(flatten)]
+    doc: Map<String, Value>,
+}
+
+fn with_version(version: u64, mut doc: Map<String, Value>) -> Value {
+    doc.insert("version".into(), version.into());
+    Value::Object(doc)
+}
+
+/// A GET when `put` is None; a stale PUT gets 409 with what's on disk.
+fn timesheet_doc(path: anyhow::Result<std::path::PathBuf>, put: Option<PutDoc>) -> Response {
+    let path = match path {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let result = match put {
+        None => timesheet::read(&path).map(|(v, d)| (StatusCode::OK, with_version(v, d))),
+        Some(p) => timesheet::put(&path, p.version, p.doc).map(|r| match r {
+            timesheet::Put::Saved(v) => (StatusCode::OK, json!({ "version": v })),
+            timesheet::Put::Stale(v, d) => (StatusCode::CONFLICT, with_version(v, d)),
+        }),
+    };
+    match result {
+        Ok((status, body)) => (status, Json(body)).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+// File locks block, so keep them off the async workers.
+async fn blocking_doc(path: anyhow::Result<std::path::PathBuf>, put: Option<PutDoc>) -> Response {
+    tokio::task::spawn_blocking(move || timesheet_doc(path, put))
+        .await
+        .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn get_settings() -> Response {
+    blocking_doc(timesheet::dir().map(|d| timesheet::settings_path(&d)), None).await
+}
+
+async fn put_settings(Json(p): Json<PutDoc>) -> Response {
+    blocking_doc(timesheet::dir().map(|d| timesheet::settings_path(&d)), Some(p)).await
+}
+
+async fn get_month(Path(month): Path<String>) -> Response {
+    blocking_doc(timesheet::dir().and_then(|d| timesheet::month_path(&d, &month)), None).await
+}
+
+async fn put_month(Path(month): Path<String>, Json(p): Json<PutDoc>) -> Response {
+    blocking_doc(timesheet::dir().and_then(|d| timesheet::month_path(&d, &month)), Some(p)).await
 }
 
 fn gitlab_kind(icon: &str) -> &'static str {
@@ -324,4 +380,48 @@ async fn proxy(
         headers.insert(header::LOCATION, l);
     }
     (status, headers, bytes).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tempdir() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "todone-server-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    async fn body(r: Response) -> Value {
+        serde_json::from_slice(&axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    fn put_body(v: Value) -> PutDoc {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_put_is_409_with_disk_contents() {
+        let path = tempdir().join("2026-10.json");
+        let ok = timesheet_doc(Ok(path.clone()), Some(put_body(json!({"version": 0, "rows": {"disk": []}}))));
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body(ok).await, json!({"version": 1}));
+
+        let stale = timesheet_doc(Ok(path.clone()), Some(put_body(json!({"version": 0, "rows": {"mine": []}}))));
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(body(stale).await, json!({"version": 1, "rows": {"disk": []}}));
+
+        let get = timesheet_doc(Ok(path), None);
+        assert_eq!(body(get).await, json!({"version": 1, "rows": {"disk": []}}));
+    }
+
+    #[tokio::test]
+    async fn bad_month_is_400() {
+        let r = timesheet_doc(timesheet::month_path(&tempdir(), "2026-13"), None);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
 }
