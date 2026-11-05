@@ -166,9 +166,11 @@ export function useDiskDoc<T extends object>(
 
   const set = useCallback(
     (f: (v: T) => T) =>
-      setState((x) =>
-        x.path === path ? { ...x, value: f(x.value), unsaved: true } : x
-      ),
+      setState((x) => {
+        if (x.path !== path) return x
+        const value = f(x.value)
+        return value === x.value ? x : { ...x, value, unsaved: true }
+      }),
     [path]
   )
   return { value: s.value, loaded: s.loaded, error: s.error, set }

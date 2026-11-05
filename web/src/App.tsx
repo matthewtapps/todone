@@ -214,8 +214,14 @@ export default function App() {
     (list: Task[]) =>
       setPrefs((p) => {
         const byId = new Map(p.tasks.map((t) => [t.id, t]))
-        for (const t of list) byId.set(t.id, t)
-        return { ...p, tasks: [...byId.values()] }
+        let changed = false
+        for (const t of list) {
+          const old = byId.get(t.id)
+          if (old && JSON.stringify(old) === JSON.stringify(t)) continue
+          byId.set(t.id, t)
+          changed = true
+        }
+        return changed ? { ...p, tasks: [...byId.values()] } : p
       }),
     [setPrefs]
   )
