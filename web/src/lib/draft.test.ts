@@ -65,3 +65,27 @@ test("draftDay splits the rest of the day and groups by task", () => {
   const byTask = Object.fromEntries(rows.map((r) => [r.taskId, r.minutes]))
   assert.deepEqual(byTask, { admin: 30, wtk: 150, lw: 150 })
 })
+
+test("draftDay stores whole minutes for events with seconds", () => {
+  const rows = draftDay(
+    {
+      did: [],
+      events: [
+        {
+          summary: "Team standup",
+          start: "2026-09-01T10:00:00+10:00",
+          end: "2026-09-01T10:29:40+10:00",
+          all_day: false,
+        },
+      ],
+    },
+    480,
+    "",
+    tasks,
+    keywords
+  )
+  assert.deepEqual(
+    rows.map((r) => r.minutes),
+    [30]
+  )
+})

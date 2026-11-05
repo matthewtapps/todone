@@ -51,7 +51,9 @@ export function draftDay(
   const ignore = ignoreEvents.trim() ? new RegExp(ignoreEvents, "i") : null
   const meetings = day.events
     .filter((e) => !e.all_day && !ignore?.test(e.summary))
-    .map((e) => [e.summary, minutesBetween(e.start, e.end)] as const)
+    .map(
+      (e) => [e.summary, Math.round(minutesBetween(e.start, e.end))] as const
+    )
   const items = mergeBullets(day.did)
   const left = Math.max(
     0,
