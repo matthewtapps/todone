@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use serde_json::{Map, Value};
 
@@ -22,8 +22,8 @@ pub fn settings_path(dir: &Path) -> PathBuf {
 }
 
 pub fn month_path(dir: &Path, month: &str) -> Result<PathBuf> {
-    let valid = month.len() == 7
-        && NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d").is_ok();
+    let valid =
+        month.len() == 7 && NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d").is_ok();
     if !valid {
         bail!("month must be YYYY-MM, got {month:?}");
     }
@@ -37,8 +37,8 @@ pub fn read(path: &Path) -> Result<(u64, Map<String, Value>)> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, Map::new())),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let mut doc: Map<String, Value> = serde_json::from_str(&data)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let mut doc: Map<String, Value> =
+        serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
     let version = doc.remove("version").and_then(|v| v.as_u64()).unwrap_or(0);
     Ok((version, doc))
 }
@@ -70,7 +70,10 @@ pub fn modify(path: &Path, f: impl FnOnce(&mut Map<String, Value>) -> Result<()>
 }
 
 /// Writes only when `f` returns true; otherwise the version stays put.
-pub fn modify_if(path: &Path, f: impl FnOnce(&mut Map<String, Value>) -> Result<bool>) -> Result<()> {
+pub fn modify_if(
+    path: &Path,
+    f: impl FnOnce(&mut Map<String, Value>) -> Result<bool>,
+) -> Result<()> {
     with_lock(path, || {
         let (version, mut doc) = read(path)?;
         if f(&mut doc)? {
@@ -91,7 +94,8 @@ fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;
-    lock.lock().with_context(|| format!("locking {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
     f()
 }
 
@@ -99,7 +103,8 @@ fn write(path: &Path, version: u64, mut doc: Map<String, Value>) -> Result<()> {
     doc.insert("version".into(), version.into());
     let tmp = path.with_extension("json.tmp");
     {
-        let mut f = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let mut f =
+            fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(serde_json::to_string_pretty(&doc)?.as_bytes())?;
         f.sync_all()?;
     }
@@ -138,8 +143,14 @@ mod tests {
     #[test]
     fn put_with_current_version_saves_and_bumps() {
         let p = tempdir().join("2026-10.json");
-        assert!(matches!(put(&p, 0, doc(json!({"rows": {}}))).unwrap(), Put::Saved(1)));
-        assert!(matches!(put(&p, 1, doc(json!({"rows": {"a": 1}}))).unwrap(), Put::Saved(2)));
+        assert!(matches!(
+            put(&p, 0, doc(json!({"rows": {}}))).unwrap(),
+            Put::Saved(1)
+        ));
+        assert!(matches!(
+            put(&p, 1, doc(json!({"rows": {"a": 1}}))).unwrap(),
+            Put::Saved(2)
+        ));
         assert_eq!(read(&p).unwrap(), (2, doc(json!({"rows": {"a": 1}}))));
     }
 
@@ -169,13 +180,23 @@ mod tests {
     fn leftover_tmp_file_does_not_block_writes() {
         let p = tempdir().join("2026-10.json");
         fs::write(p.with_extension("json.tmp"), "junk from a crash").unwrap();
-        assert!(matches!(put(&p, 0, doc(json!({"rows": {}}))).unwrap(), Put::Saved(1)));
+        assert!(matches!(
+            put(&p, 0, doc(json!({"rows": {}}))).unwrap(),
+            Put::Saved(1)
+        ));
     }
 
     #[test]
     fn modify_applies_and_bumps_version() {
         let p = tempdir().join("settings.json");
-        assert_eq!(modify(&p, |d| { d.insert("shown".into(), json!(["t"])); Ok(()) }).unwrap(), 1);
+        assert_eq!(
+            modify(&p, |d| {
+                d.insert("shown".into(), json!(["t"]));
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
         assert_eq!(read(&p).unwrap(), (1, doc(json!({"shown": ["t"]}))));
     }
 

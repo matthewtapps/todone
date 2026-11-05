@@ -1,15 +1,11 @@
 //! `todone timesheet export|import`: read and fill the timesheet from the CLI.
 
-use std::{
-    collections::BTreeMap,
-    fs, io,
-    path::Path,
-};
+use std::{collections::BTreeMap, fs, io, path::Path};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::timesheet;
 
@@ -75,23 +71,41 @@ fn new_id() -> String {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
 }
 
 pub fn resolve<'a>(tasks: &'a [Task], shown: &[String], i: &Input) -> Result<&'a Task> {
     let hits: Vec<&Task> = tasks
         .iter()
         .filter(|t| shown.contains(&t.id) && t.name == i.task)
-        .filter(|t| i.project.as_deref().is_none_or(|p| t.project_name.starts_with(p)))
+        .filter(|t| {
+            i.project
+                .as_deref()
+                .is_none_or(|p| t.project_name.starts_with(p))
+        })
         .collect();
     match hits.as_slice() {
         [t] => Ok(t),
-        [] => bail!("{}: no task named {:?} is shown in the grid", i.date, i.task),
+        [] => bail!(
+            "{}: no task named {:?} is shown in the grid",
+            i.date,
+            i.task
+        ),
         many => bail!(
             "{}: task {:?} is in more than one project ({}); add \"project\"",
             i.date,
             i.task,
-            many.iter().map(|t| t.project_name.as_str()).collect::<Vec<_>>().join(", ")
+            many.iter()
+                .map(|t| t.project_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -127,7 +141,11 @@ pub fn apply(day: &mut Vec<Row>, task_id: &str, minutes: u32, desc: &str, force:
     let row = &mut day[i];
     let untouched = row.imported.as_deref() == Some(snap(row).as_str());
     if !untouched && !force {
-        return Outcome::Skipped(if row.imported.is_some() { "edited since import" } else { "made by you" });
+        return Outcome::Skipped(if row.imported.is_some() {
+            "edited since import"
+        } else {
+            "made by you"
+        });
     }
     if minutes == 0 {
         // A pushed row at zero minutes is how the web app asks Push to delete it.
@@ -155,7 +173,9 @@ fn load_tasks(dir: &Path) -> Result<(Vec<Task>, Vec<String>)> {
 type Rows = BTreeMap<String, Vec<Row>>;
 
 fn take_rows(doc: &mut Map<String, Value>) -> Result<Rows> {
-    Ok(serde_json::from_value(doc.remove("rows").unwrap_or(json!({})))?)
+    Ok(serde_json::from_value(
+        doc.remove("rows").unwrap_or(json!({})),
+    )?)
 }
 
 pub fn import(dir: &Path, inputs: &[Input], dry_run: bool, force: bool) -> Result<Vec<String>> {
@@ -168,7 +188,10 @@ pub fn import(dir: &Path, inputs: &[Input], dry_run: bool, force: bool) -> Resul
         let minutes = u32::try_from(i.minutes)
             .with_context(|| format!("{} {}: minutes must be 0 or more", i.date, i.task))?;
         let task = resolve(&tasks, &shown, i)?;
-        months.entry(i.date.format("%Y-%m").to_string()).or_default().push((i, task, minutes));
+        months
+            .entry(i.date.format("%Y-%m").to_string())
+            .or_default()
+            .push((i, task, minutes));
     }
     let mut report = vec![];
     for (month, items) in months {
@@ -179,8 +202,14 @@ pub fn import(dir: &Path, inputs: &[Input], dry_run: bool, force: bool) -> Resul
             for (i, task, minutes) in &items {
                 let day = rows.entry(i.date.to_string()).or_default();
                 let outcome = apply(day, &task.id, *minutes, &i.desc, force);
-                changed |= matches!(outcome, Outcome::Added | Outcome::Updated | Outcome::Removed);
-                report.push(format!("{} {} / {}: {outcome:?}", i.date, task.project_name, task.name));
+                changed |= matches!(
+                    outcome,
+                    Outcome::Added | Outcome::Updated | Outcome::Removed
+                );
+                report.push(format!(
+                    "{} {} / {}: {outcome:?}",
+                    i.date, task.project_name, task.name
+                ));
             }
             rows.retain(|_, day| !day.is_empty());
             doc.insert("rows".into(), serde_json::to_value(rows)?);
@@ -198,7 +227,12 @@ pub fn import(dir: &Path, inputs: &[Input], dry_run: bool, force: bool) -> Resul
 pub fn export(dir: &Path, month: &str) -> Result<Value> {
     let (tasks, shown) = load_tasks(dir)?;
     let name = |id: &str| {
-        tasks.iter().find(|t| t.id == id).map_or(("?".into(), id.to_string()), |t| (t.project_name.clone(), t.name.clone()))
+        tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map_or(("?".into(), id.to_string()), |t| {
+                (t.project_name.clone(), t.name.clone())
+            })
     };
     let (_, mut doc) = timesheet::read(&timesheet::month_path(dir, month)?)?;
     let rows: Vec<Value> = take_rows(&mut doc)?
@@ -291,7 +325,11 @@ mod tests {
     }
 
     fn task(id: &str, name: &str, project: &str) -> Task {
-        Task { id: id.into(), name: name.into(), project_name: project.into() }
+        Task {
+            id: id.into(),
+            name: name.into(),
+            project_name: project.into(),
+        }
     }
 
     fn input(task: &str, project: Option<&str>) -> Input {
@@ -352,11 +390,17 @@ mod tests {
     #[test]
     fn skips_rows_the_user_made_or_edited() {
         let mut day = vec![row("t", 30, "mine")];
-        assert_eq!(apply(&mut day, "t", 45, "new", false), Outcome::Skipped("made by you"));
+        assert_eq!(
+            apply(&mut day, "t", 45, "new", false),
+            Outcome::Skipped("made by you")
+        );
         let mut edited = imported(row("t", 30, "old"));
         edited.minutes = 60;
         let mut day = vec![edited];
-        assert_eq!(apply(&mut day, "t", 45, "new", false), Outcome::Skipped("edited since import"));
+        assert_eq!(
+            apply(&mut day, "t", 45, "new", false),
+            Outcome::Skipped("edited since import")
+        );
         assert_eq!(day[0].minutes, 60);
     }
 
@@ -381,7 +425,10 @@ mod tests {
     #[test]
     fn two_rows_for_one_task_are_left_alone() {
         let mut day = vec![imported(row("t", 30, "a")), imported(row("t", 15, "b"))];
-        assert_eq!(apply(&mut day, "t", 45, "new", false), Outcome::Skipped("more than one row for this task"));
+        assert_eq!(
+            apply(&mut day, "t", 45, "new", false),
+            Outcome::Skipped("more than one row for this task")
+        );
     }
 
     #[test]
@@ -393,9 +440,22 @@ mod tests {
             task("hidden", "Non-billable", "GENERAL"),
         ];
         let shown: Vec<String> = ["lw-m", "lw-h", "sa"].map(String::from).to_vec();
-        assert_eq!(resolve(&tasks, &shown, &input("Systems Administration", None)).unwrap().id, "sa");
-        assert!(resolve(&tasks, &shown, &input("LW", None)).unwrap_err().to_string().contains("more than one project"));
-        assert_eq!(resolve(&tasks, &shown, &input("LW", Some("FY27"))).unwrap().id, "lw-m");
+        assert_eq!(
+            resolve(&tasks, &shown, &input("Systems Administration", None))
+                .unwrap()
+                .id,
+            "sa"
+        );
+        assert!(resolve(&tasks, &shown, &input("LW", None))
+            .unwrap_err()
+            .to_string()
+            .contains("more than one project"));
+        assert_eq!(
+            resolve(&tasks, &shown, &input("LW", Some("FY27")))
+                .unwrap()
+                .id,
+            "lw-m"
+        );
         assert!(resolve(&tasks, &shown, &input("Nope", None)).is_err());
         assert!(resolve(&tasks, &shown, &input("Non-billable", None)).is_err());
     }
@@ -440,8 +500,11 @@ mod tests {
         let dir = setup();
         let path = timesheet::month_path(&dir, "2026-11").unwrap();
         timesheet::modify(&path, |d| {
-            d.insert("rows".into(), json!({"2026-11-02": [{"id": "r", "xeroId": null, "taskId": "sa",
-                "desc": "mine", "minutes": 30, "synced": null}]}));
+            d.insert(
+                "rows".into(),
+                json!({"2026-11-02": [{"id": "r", "xeroId": null, "taskId": "sa",
+                "desc": "mine", "minutes": 30, "synced": null}]}),
+            );
             Ok(())
         })
         .unwrap();
@@ -467,6 +530,8 @@ mod tests {
     #[test]
     fn import_without_tasks_says_to_open_the_page() {
         let err = import(&tempdir(), &[], false, false).unwrap_err();
-        assert!(err.to_string().contains("open the timesheet page once so todone knows your Xero tasks"));
+        assert!(err
+            .to_string()
+            .contains("open the timesheet page once so todone knows your Xero tasks"));
     }
 }
