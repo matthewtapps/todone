@@ -29,17 +29,21 @@ type DocState<T> = {
   value: T
   unsaved: boolean
   loaded: boolean
+  gen: number
   error?: string
 }
-type Job<T> = { path: string; version: number; value: T }
+type Job<T> = { path: string; version: number; value: T; gen: number }
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
+// A save may only update the state it was sent from, not one loaded since.
+let generation = 0
 const fresh = <T>(path: string, value: T): DocState<T> => ({
   path,
   version: 0,
   value,
   unsaved: false,
   loaded: false,
+  gen: ++generation,
 })
 
 /** A server-backed document; `fallback` must be a stable module constant. */
@@ -66,6 +70,7 @@ export function useDiskDoc<T extends object>(
               value: { ...fallback, ...doc } as T,
               unsaved: false,
               loaded: true,
+              gen: ++generation,
             }
           : x
       ),
@@ -109,7 +114,7 @@ export function useDiskDoc<T extends object>(
         (r) => {
           if (r.ok)
             setState((x) =>
-              x.path === job.path && x.version === job.version
+              x.path === job.path && x.gen === job.gen
                 ? { ...x, version: r.version, unsaved: x.value !== job.value }
                 : x
             )
@@ -141,7 +146,12 @@ export function useDiskDoc<T extends object>(
       pending.current = null
       return
     }
-    pending.current = { path: s.path, version: s.version, value: s.value }
+    pending.current = {
+      path: s.path,
+      version: s.version,
+      value: s.value,
+      gen: s.gen,
+    }
     const timer = setTimeout(() => flush(), 500)
     return () => clearTimeout(timer)
   }, [s, flush])
