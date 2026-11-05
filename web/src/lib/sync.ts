@@ -15,14 +15,18 @@ const same = (a: Row, b: Row) =>
 export function mergeDay(local: Row[], fresh: Row[]): Row[] {
   const edited = local.filter((r) => r.xeroId && isDirty(r))
   const kept = new Set(edited.map((r) => r.xeroId))
-  const marker = new Map(local.map((r) => [r.xeroId, r.imported ?? null]))
+  const byXero = new Map(local.map((r) => [r.xeroId, r]))
   const incoming = fresh
     .filter((e) => !kept.has(e.xeroId))
-    .map((e) => ({
-      ...e,
-      synced: snap(e),
-      imported: marker.get(e.xeroId) ?? null,
-    }))
+    .map((e) => {
+      const old = byXero.get(e.xeroId)
+      const untouched = !!old && old.imported === snap(old) && same(old, e)
+      return {
+        ...e,
+        synced: snap(e),
+        imported: untouched ? snap(e) : (old?.imported ?? null),
+      }
+    })
   const claimed = new Set<string>()
   const unpushed = local
     .filter((r) => !r.xeroId)

@@ -73,3 +73,12 @@ test("a pulled entry keeps the import marker of the local row it replaces", () =
   )
   assert.equal(merged[0].imported, '["t","work",60]')
 })
+
+test("an untouched imported row stays untouched when Xero rewrites its whitespace", () => {
+  const local = row("local", "X1", 60, "a\nb ")
+  const merged = mergeDay(
+    [{ ...local, synced: snap(local), imported: snap(local) }],
+    [row("x", "X1", 60, "a\r\nb")]
+  )
+  assert.equal(merged[0].imported, snap(merged[0]))
+})
