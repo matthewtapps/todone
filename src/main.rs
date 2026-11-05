@@ -11,6 +11,7 @@ mod history;
 mod server;
 mod settings;
 mod storage;
+mod timesheet;
 mod vim;
 mod xero_auth;
 
