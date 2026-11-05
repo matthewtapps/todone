@@ -14,6 +14,8 @@ export type Row = {
   minutes: number
   /** Snapshot of the row as last seen in Xero; null until pushed. */
   synced: string | null
+  /** Snapshot written by `todone timesheet import`; a match means nobody edited the row since. */
+  imported?: string | null
 }
 
 export type MonthState = { rows: Record<string, Row[]> }
@@ -44,4 +46,5 @@ export const newRow = (taskId: string): Row => ({
   desc: "",
   minutes: 0,
   synced: null,
+  imported: null,
 })

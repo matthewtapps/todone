@@ -64,3 +64,12 @@ test("matching ignores whitespace differences", () => {
     ["X1"]
   )
 })
+
+test("a pulled entry keeps the import marker of the local row it replaces", () => {
+  const local = { ...row("local", "X1", 60), imported: '["t","work",60]' }
+  const merged = mergeDay(
+    [{ ...local, synced: snap(local) }],
+    [row("x", "X1", 60)]
+  )
+  assert.equal(merged[0].imported, '["t","work",60]')
+})
