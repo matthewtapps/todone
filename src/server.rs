@@ -27,7 +27,7 @@ use crate::{
 };
 
 /// Override with `TODONE_TIMESHEET_PORT` to run a second todone alongside;
-/// the browser keeps separate saved state per port.
+/// the Xero shortcode and sidebar state stay per port in the browser; timesheet data is shared on disk.
 fn port() -> u16 {
     static PORT: OnceLock<u16> = OnceLock::new();
     *PORT.get_or_init(|| {
