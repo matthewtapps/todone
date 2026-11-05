@@ -60,26 +60,15 @@ pub fn put(path: &Path, expected: u64, doc: Map<String, Value>) -> Result<Put> {
     })
 }
 
-pub fn modify(path: &Path, f: impl FnOnce(&mut Map<String, Value>) -> Result<()>) -> Result<u64> {
+/// Writes only when `f` returns true; returns the version now on disk.
+pub fn modify(path: &Path, f: impl FnOnce(&mut Map<String, Value>) -> Result<bool>) -> Result<u64> {
     with_lock(path, || {
         let (version, mut doc) = read(path)?;
-        f(&mut doc)?;
+        if !f(&mut doc)? {
+            return Ok(version);
+        }
         write(path, version + 1, doc)?;
         Ok(version + 1)
-    })
-}
-
-/// Writes only when `f` returns true; otherwise the version stays put.
-pub fn modify_if(
-    path: &Path,
-    f: impl FnOnce(&mut Map<String, Value>) -> Result<bool>,
-) -> Result<()> {
-    with_lock(path, || {
-        let (version, mut doc) = read(path)?;
-        if f(&mut doc)? {
-            write(path, version + 1, doc)?;
-        }
-        Ok(())
     })
 }
 
@@ -172,7 +161,7 @@ mod tests {
         fs::write(&p, "{ not json").unwrap();
         assert!(read(&p).is_err());
         assert!(put(&p, 0, Map::new()).is_err());
-        assert!(modify(&p, |_| Ok(())).is_err());
+        assert!(modify(&p, |_| Ok(true)).is_err());
         assert_eq!(fs::read_to_string(&p).unwrap(), "{ not json");
     }
 
@@ -192,7 +181,7 @@ mod tests {
         assert_eq!(
             modify(&p, |d| {
                 d.insert("shown".into(), json!(["t"]));
-                Ok(())
+                Ok(true)
             })
             .unwrap(),
             1

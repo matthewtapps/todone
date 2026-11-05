@@ -218,7 +218,7 @@ pub fn import(dir: &Path, inputs: &[Input], dry_run: bool, force: bool) -> Resul
         if dry_run {
             merge(&mut timesheet::read(&path)?.1)?;
         } else {
-            timesheet::modify_if(&path, merge)?;
+            timesheet::modify(&path, merge)?;
         }
     }
     Ok(report)
@@ -466,7 +466,7 @@ mod tests {
             "projectId": "g", "projectName": "GENERAL"}], "shown": ["sa"]});
         timesheet::modify(&timesheet::settings_path(&dir), |d| {
             *d = settings.as_object().unwrap().clone();
-            Ok(())
+            Ok(true)
         })
         .unwrap();
         dir
@@ -505,7 +505,7 @@ mod tests {
                 json!({"2026-11-02": [{"id": "r", "xeroId": null, "taskId": "sa",
                 "desc": "mine", "minutes": 30, "synced": null}]}),
             );
-            Ok(())
+            Ok(true)
         })
         .unwrap();
         let rows = inputs(json!([
