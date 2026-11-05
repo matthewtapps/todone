@@ -74,7 +74,7 @@ import {
 } from "@/lib/api"
 import { draftDay } from "@/lib/draft"
 import { mergeDay } from "@/lib/sync"
-import { load, monthKey, save, useStored } from "@/lib/storage"
+import { migrateLocal, save, useDiskDoc } from "@/lib/storage"
 import {
   fmt,
   isWeekend,
@@ -111,13 +111,6 @@ function useQueryParam(name: string, fallback: string) {
   return [value, setValue] as const
 }
 
-const loadRows = (month: string): Rows => {
-  const rows = load<{ rows: Rows }>(monthKey(month), { rows: {} }).rows
-  return Object.fromEntries(
-    Object.entries(rows).map(([d, list]) => [d, list.filter((r) => r.taskId)])
-  )
-}
-
 /** True once `on` has held for `delay` ms, so quick loads never flash a skeleton. */
 function useDelayed(on: boolean, delay = 200) {
   const [shown, setShown] = useState(false)
@@ -134,49 +127,57 @@ function useDelayed(on: boolean, delay = 200) {
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
+type Prefs = {
+  tasks: Task[]
+  shown: string[]
+  keywords: Record<string, string>
+  billable: Record<string, boolean>
+  settings: Settings
+}
+const DEFAULT_PREFS: Prefs = {
+  tasks: [],
+  shown: [],
+  keywords: {},
+  billable: {},
+  settings: { hoursPerDay: 8, ignoreEvents: "private appointment" },
+}
+const EMPTY_MONTH: { rows: Rows } = { rows: {} }
+
 export default function App() {
   const [month, setMonth] = useQueryParam("month", thisMonth())
   const dates = useMemo(() => monthDates(month), [month])
+  const [reload, setReload] = useState(0)
 
-  const [tasks, setTasks] = useStored<Task[]>("timesheet:tasks", [])
-  const [shown, setShown] = useStored<string[]>("timesheet:shown", [])
-  const [keywords, setKeywords] = useStored<Record<string, string>>(
-    "timesheet:keywords",
-    {}
+  const [migrated, setMigrated] = useState(false)
+  useEffect(() => {
+    migrateLocal()
+      .catch((e) =>
+        toast.error("Couldn't move saved timesheet data to disk.", {
+          description: errorText(e),
+        })
+      )
+      .finally(() => {
+        setReload((n) => n + 1)
+        setMigrated(true)
+      })
+  }, [])
+
+  const prefs = useDiskDoc("/api/timesheet/settings", DEFAULT_PREFS, reload)
+  const { tasks, shown, keywords, billable, settings } = prefs.value
+  const setPrefs = prefs.set
+  const monthDoc = useDiskDoc(`/api/timesheet/${month}`, EMPTY_MONTH, reload)
+  const rows = monthDoc.value.rows
+  const setMonthDoc = monthDoc.set
+  const setRows = useCallback(
+    (f: (r: Rows) => Rows) => setMonthDoc((d) => ({ rows: f(d.rows) })),
+    [setMonthDoc]
   )
   // Unset tasks count as billable unless Xero names them non-billable.
-  const [billable, setBillable] = useStored<Record<string, boolean>>(
-    "timesheet:billable",
-    {}
-  )
   const isBillable = useCallback(
     (t: Task) => billable[t.id] ?? !/non-?billable/i.test(t.name),
     [billable]
   )
-  const [settings, setSettings] = useStored<Settings>("timesheet:settings", {
-    hoursPerDay: 8,
-    ignoreEvents: "private appointment",
-  })
 
-  // Rows are per month; switching months swaps them during render so a save never lands on the wrong key.
-  const [monthRows, setMonthRows] = useState(() => ({
-    month,
-    rows: loadRows(month),
-  }))
-  const current =
-    monthRows.month === month ? monthRows : { month, rows: loadRows(month) }
-  if (current !== monthRows) setMonthRows(current)
-  const rows = current.rows
-  useEffect(
-    () => save(monthKey(monthRows.month), { rows: monthRows.rows }),
-    [monthRows]
-  )
-  const setRows = useCallback(
-    (f: (r: Rows) => Rows) => setMonthRows((s) => ({ ...s, rows: f(s.rows) })),
-    []
-  )
-
-  const [reload, setReload] = useState(0)
   const todoneKey = `${month}#${reload}`
   const [fetched, setFetched] = useState<{
     key: string
@@ -211,12 +212,12 @@ export default function App() {
 
   const addTasks = useCallback(
     (list: Task[]) =>
-      setTasks((prev) => {
-        const byId = new Map(prev.map((t) => [t.id, t]))
+      setPrefs((p) => {
+        const byId = new Map(p.tasks.map((t) => [t.id, t]))
         for (const t of list) byId.set(t.id, t)
-        return [...byId.values()]
+        return { ...p, tasks: [...byId.values()] }
       }),
-    [setTasks]
+    [setPrefs]
   )
 
   const loadAssigned = useCallback(async () => {
@@ -606,7 +607,10 @@ export default function App() {
     )
 
   const hide = (ids: string[]) => {
-    setShown((s) => s.filter((id) => !ids.includes(id)))
+    setPrefs((p) => ({
+      ...p,
+      shown: p.shown.filter((id) => !ids.includes(id)),
+    }))
     const kept = visible
       .filter((t) => ids.includes(t.id) && hasTime(t.id))
       .map((t) => t.name)
@@ -619,24 +623,29 @@ export default function App() {
   const [kwTask, setKwTask] = useState<Task | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
 
-  const loading = !todone.data && !todone.error
+  const loadError = todone.error ?? prefs.error ?? monthDoc.error
+  const loading =
+    (!todone.data && !todone.error) ||
+    !migrated ||
+    !prefs.loaded ||
+    !monthDoc.loaded
   const showSkeleton = useDelayed(loading || booting)
   const addTask = (
     <AddTask
       tasks={hidden}
-      onAdd={(id) => setShown((s) => [...s, id])}
+      onAdd={(id) => setPrefs((p) => ({ ...p, shown: [...p.shown, id] }))}
       onFetchAll={fetchAll}
     />
   )
 
-  const body = todone.error ? (
+  const body = loadError ? (
     <Empty className="m-auto">
       <EmptyHeader>
         <EmptyMedia variant="icon">
           <AlertTriangleIcon />
         </EmptyMedia>
-        <EmptyTitle>Couldn't Load todone</EmptyTitle>
-        <EmptyDescription>{todone.error}</EmptyDescription>
+        <EmptyTitle>Couldn't Load Timesheet</EmptyTitle>
+        <EmptyDescription>{loadError}</EmptyDescription>
       </EmptyHeader>
       <EmptyContent>
         <Button onClick={() => setReload((n) => n + 1)}>Try Again</Button>
@@ -692,7 +701,9 @@ export default function App() {
       onHide={hide}
       onEditKeywords={setKwTask}
       isBillable={isBillable}
-      onBillable={(id, value) => setBillable((b) => ({ ...b, [id]: value }))}
+      onBillable={(id, value) =>
+        setPrefs((p) => ({ ...p, billable: { ...p.billable, [id]: value } }))
+      }
     />
   )
 
@@ -871,7 +882,11 @@ export default function App() {
         value={kwTask ? (keywords[kwTask.id] ?? "") : ""}
         onOpenChange={(o) => !o && setKwTask(null)}
         onSave={(v) => {
-          if (kwTask) setKeywords((k) => ({ ...k, [kwTask.id]: v }))
+          if (kwTask)
+            setPrefs((p) => ({
+              ...p,
+              keywords: { ...p.keywords, [kwTask.id]: v },
+            }))
           setKwTask(null)
         }}
       />
@@ -880,7 +895,7 @@ export default function App() {
         onOpenChange={setSettingsOpen}
         settings={settings}
         onSave={(s) => {
-          setSettings(s)
+          setPrefs((p) => ({ ...p, settings: s }))
           setSettingsOpen(false)
         }}
       />

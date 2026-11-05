@@ -3,9 +3,11 @@ import type { Row, Session, Task, TodoneDay } from "./types.ts"
 
 export class ApiError extends Error {
   status: number
-  constructor(message: string, status: number) {
+  body: unknown
+  constructor(message: string, status: number, body?: unknown) {
     super(message)
     this.status = status
+    this.body = body
   }
 }
 
@@ -20,7 +22,11 @@ async function request<T>(path: string, opts: RequestInit = {}) {
   })
   const body = await r.json().catch(() => null)
   if (!r.ok)
-    throw new ApiError(body?.error || `${r.status} ${r.statusText}`, r.status)
+    throw new ApiError(
+      body?.error || `${r.status} ${r.statusText}`,
+      r.status,
+      body
+    )
   return { body: body as T, headers: r.headers }
 }
 
@@ -213,3 +219,33 @@ export const updateEntry = (row: Row, date: string) =>
 
 export const removeEntry = (row: Row) =>
   xapi(`projects/${row.xeroProject}/time/${row.xeroId}`, { method: "DELETE" })
+
+export type Saved =
+  | { ok: true; version: number }
+  | { ok: false; version: number; doc: Record<string, unknown> }
+
+export const getDoc = (path: string) =>
+  api<{ version: number } & Record<string, unknown>>(path)
+
+export async function putDoc(
+  path: string,
+  version: number,
+  doc: object,
+  keepalive = false
+): Promise<Saved> {
+  try {
+    const r = await api<{ version: number }>(path, {
+      method: "PUT",
+      body: JSON.stringify({ ...doc, version }),
+      keepalive,
+    })
+    return { ok: true, version: r.version }
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status !== 409) throw e
+    const { version: v, ...disk } = e.body as { version: number } & Record<
+      string,
+      unknown
+    >
+    return { ok: false, version: v, doc: disk }
+  }
+}
