@@ -12,6 +12,7 @@ mod server;
 mod settings;
 mod storage;
 mod timesheet;
+mod timesheet_cli;
 mod vim;
 mod xero_auth;
 
@@ -43,6 +44,9 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("export") {
         return export::run(&args[1..], &runtime);
+    }
+    if args.first().map(String::as_str) == Some("timesheet") {
+        return timesheet_cli::run(&args[1..]);
     }
 
     runtime.spawn(server::serve());
